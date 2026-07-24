@@ -1,0 +1,22 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<Configuration>
+  <MCU>AT32F403A</MCU>
+  <HSE>8.000</HSE>
+  <HSEDIV>2</HSEDIV>
+  <PLLHSEPSC>1</PLLHSEPSC>
+  <PLL_RC>1</PLL_RC>
+  <ConfigMode>0</ConfigMode>
+  <PLL_MUL>60</PLL_MUL>
+  <PLL_MS>1</PLL_MS>
+  <PLL_NS>31</PLL_NS>
+  <PLL_FR>1</PLL_FR>
+  <SYSCLK_Select>1</SYSCLK_Select>
+  <AHBPSC>1</AHBPSC>
+  <APB1PSC>2</APB1PSC>
+  <APB2PSC>2</APB2PSC>
+  <USBPSC>1</USBPSC>
+  <HSI48M_FOR_SYSCLK>0</HSI48M_FOR_SYSCLK>
+  <HSI_FOR_USB>1</HSI_FOR_USB>
+  <CLKOUT>0</CLKOUT>
+  <CLKOUT_Div>1</CLKOUT_Div>
+</Configuration>

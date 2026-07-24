@@ -1,0 +1,24 @@
+# Windows metadata
+desktop.ini
+Thumbs.db
+
+# EIDE local state and generated output
+**/.eide/log/
+**/.eide.usr.ctx.json
+**/.settings/
+**/build/
+**/bin/
+**/obj/
+**/out/
+*.ept
+*.eide-template
+
+# Keil generated output and per-user state
+MDK_v5/Objects/
+MDK_v5/Listings/
+MDK_v5/*.uvguix.*
+MDK_v5/*.uvgui.*
+MDK_v5/JLinkLog.txt
+
+# Editor-local debug configuration
+**/.vscode/launch.json
