@@ -1,9 +1,16 @@
 {
     "folders": [
         {
+            "name": "MDK_v5 (EIDE Project)",
             "path": "."
+        },
+        {
+            "name": "EH-motor (Git Repository)",
+            "path": ".."
         }
     ],
-    "settings": {},
+    "settings": {
+        "git.openRepositoryInParentFolders": "always"
+    },
     "extensions": {}
 }
