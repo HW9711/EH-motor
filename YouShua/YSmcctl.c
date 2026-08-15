@@ -9,8 +9,11 @@
 mcParam_PIController2 MC_Spd;
 mcParam_PIController2 MC_VBus;
 
+uint16_t YSPara1[ParaNum];
+uint16_t YSPara2[ParaNum];
+
 //有刷通道1参数
-uint16_t YSPara1[ParaNum] = {
+uint16_t SYSPara1[ParaNum] = {
 	1,				//- 0		地址
 	
 	7000,			//- 1   最大转速设定*10							：系统参数以01为准
@@ -71,8 +74,8 @@ uint16_t YSPara1[ParaNum] = {
 	200,			//- 42	通道1缺陷保护时间
 	
 	
-	1000,			//- 43	转速环Kp
-	100,			//- 44	转速环Ki
+	800,			//- 43	转速环Kp
+	50,			//- 44	转速环Ki
 	0,				//- 45	转速环Kd
 	10,				//- 46	转速环目标速度闭环爬升		-100
 	10,				//- 47	转速环目标速度闭环下降		-100 
@@ -100,7 +103,7 @@ uint16_t YSPara1[ParaNum] = {
 
 
 //有刷通道2参数
-uint16_t YSPara2[ParaNum] = {
+uint16_t SYSPara2[ParaNum] = {
 
 	2,				//- 0		地址
 	
@@ -161,8 +164,8 @@ uint16_t YSPara2[ParaNum] = {
 	30,				//- 41  通道2缺相保护-当前转速
 	200,			//- 42	通道2缺陷保护时间
 
-	1000,			//- 43	转速环Kp
-	100,			//- 44	转速环Ki
+	800,			//- 43	转速环Kp
+	50,			//- 44	转速环Ki
 	0,				//- 45	转速环Kd
 	10,				//- 46	转速环目标速度闭环爬升
 	10,				//- 47	转速环目标速度闭环下降

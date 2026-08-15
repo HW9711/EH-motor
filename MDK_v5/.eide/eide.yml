@@ -12,6 +12,7 @@ virtualFolder:
       files:
         - path: ../UserCode/interrupt.c
         - path: ../UserCode/mcuart.c
+        - path: ../UserCode/driver_param.c
         - path: ../UserCode/mcflash.c
         - path: ../MotorCode/mclib.c
       folders: []

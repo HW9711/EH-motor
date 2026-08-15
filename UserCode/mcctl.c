@@ -20,6 +20,7 @@
 #include "fangbo_nohall.h"
 #include "youshua.h"
 #include "YSprotect.h"
+#include "driver_param.h"
 
 
 APP_TYPEDEF App;										//无刷全部变量	
@@ -315,6 +316,7 @@ void Hard_Init(void){
 	App.Logic.MotorFlashAddr2 = TEST_FLASH_ADDRESS_START2;
 	//读取模式参数
 	F4Flash_SMCPara_Read(App.Logic.MotorFlashAddr2,MCPara2,ParaNum,SMCPara2);
+	DriverParam_Init();
 	/**************************硬件初始化***************************************************/
 	//DAC初始化
 	DAC_Init_App();

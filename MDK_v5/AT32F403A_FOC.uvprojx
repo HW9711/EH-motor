@@ -393,6 +393,11 @@
               <FilePath>..\UserCode\mcuart.c</FilePath>
             </File>
             <File>
+              <FileName>driver_param.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\UserCode\driver_param.c</FilePath>
+            </File>
+            <File>
               <FileName>mcflash.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\UserCode\mcflash.c</FilePath>

@@ -9,6 +9,7 @@
 #include "youshua.h"
 #include "YSmcctl.h"
 #include "YSstatemachine.h"
+#include "driver_param.h"
 #define IDNE_TIM    20
 
 extern uint16_t SPStatus[SpeNum];
@@ -60,6 +61,9 @@ void Modbus_Ctl(USART_Type* USARTx,MCUART_Type *seruart){
 		seruart->RxCRCL = seruart->R_DATA[seruart->RxLen - 2];
 		seruart->RxCRC = seruart->RxCRCH + seruart->RxCRCL;		
 		seruart->CalcCRC = CRC_Calc(seruart->R_DATA,seruart->RxLen - 2);	
+		if(DriverParam_TryHandle(USARTx,seruart) != 0U){
+			return;
+		}
 		//从模式（上位机发送指令，当前板子接收并处理）
 		if(
 			(seruart->Addr == MCPara[0] || seruart->Addr == 0xEE) 
@@ -717,8 +721,8 @@ void YSCustomize_Return(USART_Type* USARTx,MCUART_Type* seruart){
 	uint32_t temp = 0;
 	uint32_t temp1 = 0;
 	uint32_t temp2 = 0;
-	temp1 = (uint32_t)(App2.Ch1.Prot.OverCurrent*100);
-	temp2 = (uint32_t)(App2.Ch2.Prot.OverCurrent*100);
+	temp1 = (uint32_t)(App2.Ch1.ADC.CurLPF*100);		//通道1回传ADC滤波后的实际电流，单位0.01A
+	temp2 = (uint32_t)(App2.Ch2.ADC.CurLPF*100);		//通道2回传ADC滤波后的实际电流，单位0.01A
 	
 	seruart->T_DATA[0] = 0xAA;									//帧头
 	seruart->T_DATA[1] = App2.Log.CtlMode;			//控制模式

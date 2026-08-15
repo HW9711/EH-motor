@@ -32,6 +32,8 @@ extern mcParam_PIController2 MC_VBus;
 
 extern uint16_t YSPara1[ParaNum];
 extern uint16_t YSPara2[ParaNum];
+extern uint16_t SYSPara1[ParaNum];
+extern uint16_t SYSPara2[ParaNum];
 void mcLib_InitPI2( mcParam_PIController2 *pParam);
 void mcLib_CalcPI2( mcParam_PIController2 *pParam);
 
