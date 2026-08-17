@@ -36,4 +36,11 @@ void Modbus_20_Return(void);
 void ModbusResponse(USART_Type* USARTx,MCUART_Type* seruart);
 void YSCustomize_Return(USART_Type* USARTx,MCUART_Type* seruart);
 
+/*
+ * 函数功能：控制租约超时后立即关闭无刷和有刷全部功率输出，并要求零速帧重新武装。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
+void MotorCommand_ForceCommunicationStop(void);
+
 #endif 

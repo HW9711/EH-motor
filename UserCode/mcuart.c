@@ -11,11 +11,102 @@
 #include "YSstatemachine.h"
 #include "driver_param.h"
 #define IDNE_TIM    20
+#define MOTOR_COMMAND_FRAME_LENGTH 11U /* 手柄控制帧固定为11字节，末2字节必须是CRC16。 */
+#define MOTOR_COMMAND_FREQUENCY_MAX 100U /* 往复频率命令上限为100，防止乘2后发生8位回绕。 */
+
+static volatile uint8_t s_motor_command_zero_required = 1U; /* 上电或通信超时后必须先收到合法零速帧，禁止旧RUN直接恢复。 */
 
 extern uint16_t SPStatus[SpeNum];
 extern void TIM_Motor_PWM(TMR_Type* TMRx);
 volatile uint8_t YSorWSFlag = 1;		//有刷还是无刷 1-无刷 2有刷
 	
+/*
+ * 函数功能：校验11字节手柄控制帧的模式、电机类型和闭环类型组合是否属于已定义协议。
+ * 输入参数：seruart 为已经完成长度和CRC计算的串口接收上下文。
+ * 返回参数：字段语义有效返回1，否则返回0且本帧不得刷新通信租约。
+ */
+static uint8_t MotorCommand_IsSemanticallyValid(const MCUART_Type *seruart)
+{
+	uint8_t motor_kind; /* 保存协议byte3的电机类型，1/2为无刷，3/4为有刷。 */
+	uint8_t run_type; /* 保存协议byte6的运行反馈类型，必须与电机类型匹配。 */
+
+	if((seruart == 0) || (seruart->RxLen != MOTOR_COMMAND_FRAME_LENGTH))
+	{
+		return 0U; /* 空上下文或非固定长度不能作为手柄控制命令。 */
+	}
+	if((seruart->R_DATA[1] < 1U) || (seruart->R_DATA[1] > 5U))
+	{
+		return 0U; /* 控制模式仅允许正转、反转、往复和两个定位方向。 */
+	}
+	if(seruart->R_DATA[2] > MOTOR_COMMAND_FREQUENCY_MAX)
+	{
+		return 0U; /* 异常频率不能进入后续乘2逻辑，避免回绕成不可预测值。 */
+	}
+
+	motor_kind = seruart->R_DATA[3]; /* 读取电机类型后按无刷和有刷分别验证byte6。 */
+	run_type = seruart->R_DATA[6]; /* byte6在无刷表示有无Hall，在有刷表示刀头类型。 */
+	if((motor_kind < 1U) || (motor_kind > 4U))
+	{
+		return 0U; /* 只允许板上两路无刷和两路有刷电机。 */
+	}
+	if(motor_kind <= 2U)
+	{
+		return ((run_type == 1U) || (run_type == 2U)) ? 1U : 0U; /* 无刷只接受无Hall或有Hall类型。 */
+	}
+
+	return ((run_type == 3U) || (run_type == 4U)) ? 1U : 0U; /* 有刷只接受刀头1或刀头2类型。 */
+}
+
+/*
+ * 函数功能：手柄控制租约超时后立即清零无刷和有刷目标并关闭全部PWM，进入通信故障态。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
+void MotorCommand_ForceCommunicationStop(void)
+{
+	s_motor_command_zero_required = 1U; /* 超时后重新武装零速门禁，恢复通信也不能由旧非零帧直接起机。 */
+
+	App.Logic.Set_Spd = 0U; /* 清无刷共享目标转速，状态机不得继续消费上一帧RUN。 */
+	App.Logic.CtlMode = 0U; /* 清无刷控制模式，停止往复和定位流程继续推进。 */
+	App.Logic.Brake_Sign = 0U; /* 通信超时采用直接关PWM，不再等待普通刹车状态机。 */
+	App.Logic.Brake_Kind = 0U; /* 清历史刹车类型，故障恢复后由新零速帧重新建立状态。 */
+	App.Logic.Motor_Stop_StartFlag = 0U; /* 清启停延时请求，防止错误退出后继承旧启动阶段。 */
+	App.Logic.VBusSetPWM = 0; /* 清无刷母线目标PWM，避免控制环再次抬高输出。 */
+	App.Logic.VBusNowPWM = 0; /* 同步清无刷当前PWM软件量，保持反馈状态与硬件关断一致。 */
+	App.Pos.Start = 0U; /* 取消尚未完成的定位启动，通信恢复前禁止继续拖动。 */
+	App.Pos.PosFlag = 0U; /* 清位置刹车请求，避免故障恢复后自动执行旧动作。 */
+	App.FB.Start = 0U; /* 撤销无刷通道1应用层启动标志。 */
+	App.FB.AllRun = 0U; /* 清无刷通道1底层运行标志，反馈必须立即显示停机。 */
+	App.FB.Spd_Set = 0.0f; /* 清无刷通道1速度环目标。 */
+	App.FB.Err = E_HandShake; /* 通道1进入通信故障，只有合法零速帧可以清除。 */
+	App.FB.Status = HS_ERR; /* 直接切到错误状态，阻止正常运行状态继续开桥。 */
+	App.FB2.Start = 0U; /* 撤销无刷通道2应用层启动标志。 */
+	App.FB2.AllRun = 0U; /* 清无刷通道2底层运行标志。 */
+	App.FB2.Spd_Set = 0.0f; /* 清无刷通道2速度环目标。 */
+	App.FB2.Err = E_HandShake; /* 通道2同步进入通信故障。 */
+	App.FB2.Status = HS_ERR; /* 通道2直接进入错误状态并保持PWM关闭。 */
+	PWM_3l_Stop(); /* 立即关闭无刷通道1全部上下桥，安全动作不依赖下一次状态机调度。 */
+	PWM_3l_Stop2(); /* 立即关闭无刷通道2全部上下桥。 */
+
+	App2.Log.CtlMode = 0U; /* 清有刷控制模式，停止单向和往复调度。 */
+	App2.Log.u32SetSpd = 0U; /* 清有刷串口目标转速。 */
+	App2.Log.BreakSta = 0U; /* 通信故障采用关PWM，不保留普通刹车阶段。 */
+	App2.SysCtl.SpdSet = 0.0f; /* 清有刷速度环目标。 */
+	App2.SysCtl.SpdSetSet = 0.0f; /* 清有刷爬坡后的实际PID目标。 */
+	App2.SysCtl.PwmSet = 0; /* 清有刷PWM目标值，避免控制环再次写入非零比较值。 */
+	App2.SysCtl.PwmNow = 0; /* 同步清有刷当前PWM软件量。 */
+	App2.Ch1.Start = 0U; /* 撤销有刷通道1启动标志。 */
+	App2.Ch1.AllowRun = 0U; /* 禁止有刷通道1继续运行。 */
+	App2.Ch1.Status = CTLS_ERROR; /* 通道1进入错误状态，等待通信故障清除。 */
+	App2.Ch2.Start = 0U; /* 撤销有刷通道2启动标志。 */
+	App2.Ch2.AllowRun = 0U; /* 禁止有刷通道2继续运行。 */
+	App2.Ch2.Status = CTLS_ERROR; /* 通道2进入错误状态。 */
+	App2.Err = E_HandShake; /* 有刷总状态同步报告通信超时。 */
+	TIME1_PWM_Stop_3Channel(); /* 立即把有刷通道1比较值清零。 */
+	TIME8_PWM_Stop_3Channel(); /* 立即把有刷通道2比较值清零。 */
+	Vbus_Tim_OFF(); /* 清BUCK母线PWM，避免有刷功率级在控制失联后继续供能。 */
+}
+
 //所有串口数据处理
 void UartDealResponse(void){
 	#if _Uart1 == 1
@@ -448,22 +539,37 @@ void Modbus_Ctl(USART_Type* USARTx,MCUART_Type *seruart){
 		}		
 		
 		else if(	//私有协议：判断有无刷、有无Hall、刹车类型、保护电流
-			(seruart->Addr == 0xAA)//地址校验 
-			&& (seruart->CalcCRC == seruart->RxCRC || seruart->RxCRC == 0xAABB)
+			(seruart->Addr == 0xAA) /* 私有手柄控制帧固定地址。 */
+			&& (seruart->CalcCRC == seruart->RxCRC) /* 只接受真实CRC，禁止历史AABB旁路续租。 */
 			&& seruart->RxLen == 11
 		){
 
-			if(App.FB.Err == E_HandShake || App.FB2.Err == E_HandShake || App2.Err == E_HandShake){
-				App2.Err = E_NONE;		//错误清除
-				App.FB.Err = E_NONE;	//清除错误
-				App.FB2.Err =E_NONE;	//清除错误
+			if(MotorCommand_IsSemanticallyValid(seruart) == 0U)
+			{
+				return; /* CRC虽正确但字段组合非法时整帧丢弃，不能续租也不能改变电机状态。 */
 			}
-			App.Logic.HandShakeProtCnt = 0;			//收到一帧正确数据，清除通讯握手计时
-			App.Logic.Set_Spd =(uint32_t)(((seruart->R_DATA[4]<<8)+seruart->R_DATA[5])*10);		//计算转速
-			if(App.Logic.Set_Spd == 0){		//停机判断
-				App2.Err = E_NONE;								//错误清除
-				App.FB.Err = E_NONE;							//清除错误
-				App.FB2.Err = E_NONE;							//清楚错误							
+
+			App.Logic.Set_Spd = (uint32_t)(((seruart->R_DATA[4] << 8) + seruart->R_DATA[5]) * 10); /* 在续租前解析目标值，用于故障后零速解锁。 */
+			if((s_motor_command_zero_required != 0U) && (App.Logic.Set_Spd != 0U))
+			{
+				App.Logic.Set_Spd = 0U; /* 拒绝恢复前的非零命令时立即清回零速，防止返回前短暂发布旧 RUN 目标。 */
+				return; /* 上电或超时恢复后的第一帧必须为零速，拒绝旧RUN直接恢复输出。 */
+			}
+			if(App.Logic.Set_Spd == 0U)
+			{
+				s_motor_command_zero_required = 0U; /* 合法零速帧完成重新武装，后续新的非零控制帧才允许启动。 */
+			}
+
+			if(App.FB.Err == E_HandShake || App.FB2.Err == E_HandShake || App2.Err == E_HandShake){
+				App2.Err = E_NONE; /* 只在通过CRC、语义和零速门禁后清有刷通信故障。 */
+				App.FB.Err = E_NONE; /* 清无刷通道1通信故障，状态机随后回到等待态。 */
+				App.FB2.Err = E_NONE; /* 清无刷通道2通信故障。 */
+			}
+			App.Logic.HandShakeProtCnt = 0U; /* 只有完整合法控制帧才能刷新200ms控制租约。 */
+			if(App.Logic.Set_Spd == 0U){
+				App2.Err = E_NONE; /* 保持原协议：合法零速帧允许清除可恢复错误。 */
+				App.FB.Err = E_NONE; /* 零速帧清无刷通道1错误。 */
+				App.FB2.Err = E_NONE; /* 零速帧清无刷通道2错误。 */
 			}
 			if(YSorWSFlag == 1){						//无刷
 				if(seruart->R_DATA[3] != 1 && seruart->R_DATA[3] != 2){

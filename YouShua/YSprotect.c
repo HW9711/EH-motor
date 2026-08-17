@@ -40,19 +40,17 @@ void YSProtect_Init(void){
 }
 
 
-//有刷保护函数
+/*
+ * 函数功能：执行有刷通道堵转和过流保护；通信租约由SystemProtect统一处理。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void YSMotor_Protect(void){
 if(App2.SysCtl.CheckCyc == 1 && App2.Err == E_NONE){
 		App2.SysCtl.CheckCyc = 0;
 
-		if(App.Logic.HandShakeProtCnt > App.Logic.HandShakeProtTim){
-			App2.Err = E_HandShake;					//通讯错误
-			
-		}else{
-			App.Logic.HandShakeProtCnt++;
-		}
-	
-		if(App2.Log.Channel == 3){
+		/* 通信租约只允许SystemProtect按1ms累计一次，避免有刷模式重复计数使200ms门限减半。 */
+				if(App2.Log.Channel == 3){
 			//堵转保护1,电机1			--正转和反转有效--往复正反转无效
 			if((App2.Ch1.AllowRun == 1)&&(App2.Log.CtlMode !=3)){
 				if(App2.Log.RunTimCnt1 <= YSPara1[55] * 10 || App2.Log.BreakSta == 1){

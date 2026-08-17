@@ -2,6 +2,7 @@
 #include "logic.h"
 #include "youshua.h"
 #include "adc.h"
+#include "mcuart.h"
 void Protect_Init(void){
 	App.FB.Prot.CurrentLPFXiSHU = (float)MCPara[9]/100.0f;
 	
@@ -29,7 +30,7 @@ void Protect_Init(void){
 	App.FB2.Prot.OverCurrentCnt4 = MCPara2[18];	
 	
 	//通讯保护时间
-	App.Logic.HandShakeProtTim = MCPara[10]*100;	//转化成毫秒
+	App.Logic.HandShakeProtTim = MOTOR_HARD_COMMAND_TIMEOUT_MS; /* 控制租约固定200ms，参数区不能关闭或延长硬停机。 */
 	
 }
 
@@ -223,7 +224,11 @@ void Motor_Protect(void){
 
 
 
-//系统保护函数
+/*
+ * 函数功能：执行无刷和有刷共用的1ms系统保护，并在手柄控制租约超时时立即关闭全部功率输出。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void SystemProtect(void){
 
 	if((App2.SysCtl.CalAdcFg == 1)&&(App.FB.Err == E_NONE && App.FB2.Err ==  E_NONE)&&(App2.Err == E_NONE))  {
@@ -237,15 +242,14 @@ void SystemProtect(void){
 	if(App2.SysPort.SystemProtectFlag == 1){
 			App2.SysPort.SystemProtectFlag = 0;
 			//通讯保护
-			if(App.Logic.HandShakeProtCnt >App.Logic.HandShakeProtTim){
-				App2.Err = E_HandShake;
-				App.FB.Err 	=	E_HandShake;
-				App.FB2.Err =	E_HandShake;
+			if(App.Logic.HandShakeProtCnt >= App.Logic.HandShakeProtTim){
+				App.Logic.HandShakeProtCnt = App.Logic.HandShakeProtTim; /* 超时后计数饱和，避免长时间失联发生32位回绕。 */
+				MotorCommand_ForceCommunicationStop(); /* 200ms未收到合法控制帧时直接关无刷、有刷PWM并进入通信故障。 */
 			}else{
-				App.Logic.HandShakeProtCnt++;
+				App.Logic.HandShakeProtCnt++; /* 只有mcuart收到严格CRC且字段有效的控制帧才会清零本计数。 */
 			}
 		
-			//欠压保护		
+			//欠压保护
 			if(App.FB.Prot.BusVol < App.FB.Prot.UnderVoltage){
 				App.FB.Prot.UndVolCnt ++;
 				if(App.FB.Prot.UndVolCnt > MCPara[3]){
