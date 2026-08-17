@@ -27,14 +27,14 @@
 //#define     RSHUNT                       	(float)(0.013f)   //采样电阻3个R040
 #define     RSHUNT                       	(float)(0.034f)  //采样电阻3个R100
 //#define     RSHUNT                       	(float)(0.067f)  //采样电阻3个R24444444444444444444444444r00
-#define     RS_HIGH                      	(float)(10.0f)  // 实测相电流及有刷总电流采集增益为10
+#define     RS_HIGH                      	(float)(18.0f)  // 实测相电流及有刷总电流采集增益为18
 #define     RS_LOW                       	(float)(1.0f)
 #define     CAMP_SCALE                   	(float)((RS_HIGH/RS_LOW))
 #define     MAX_BOARD_CURRENT            	(float)(MAX_ADC_INPUT_VOLTAGE/RSHUNT/CAMP_SCALE)      
 #define     ADC_CURRENT_SCALE            	(float)(MAX_BOARD_CURRENT/MAX_ADC_COUNT)
 	
 #define     RSHUNT_t                    	(float)(0.01) 
-#define 		CAMP_SCALE_t                 	(float)(10.0f)  // 实测无刷总电流采集增益为10
+#define 		CAMP_SCALE_t                 	(float)(18.0f)  // 实测无刷总电流采集增益为18
 #define 		MAX_BOARD_CURRENT_t          	(float)(MAX_ADC_INPUT_VOLTAGE/RSHUNT_t/CAMP_SCALE_t)      
 #define 		ADC_CURRENT_SCALE_t          	(float)(MAX_BOARD_CURRENT_t/MAX_ADC_COUNT)
 	

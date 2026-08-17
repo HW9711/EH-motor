@@ -76,13 +76,13 @@ uint16_t SYSPara1[ParaNum] = {
 	
 	800,			//- 43	转速环Kp
 	50,			//- 44	转速环Ki
-	0,				//- 45	转速环Kd
+	500,				//- 45	转速环Kc（抗积分饱和）
 	10,				//- 46	转速环目标速度闭环爬升		-100
 	10,				//- 47	转速环目标速度闭环下降		-100 
 		
 	300,			//- 48	电压环Kp
 	1,				//- 49	电压环Ki
-	0,				//- 50	电压环Kd
+	1,				//- 50	电压环Kc（抗积分饱和）
 	50,				//- 51	电压环PWM闭环攀升			-50
 	50,				//- 52	电压环PWM闭环下降			-50
 	
@@ -166,13 +166,13 @@ uint16_t SYSPara2[ParaNum] = {
 
 	800,			//- 43	转速环Kp
 	50,			//- 44	转速环Ki
-	0,				//- 45	转速环Kd
+	500,				//- 45	转速环Kc（抗积分饱和）
 	10,				//- 46	转速环目标速度闭环爬升
 	10,				//- 47	转速环目标速度闭环下降
 	
 	300,			//- 48	电压环Kp
 	1,				//- 49	电压环Ki
-	0,				//- 50	电压环Kd
+	1,				//- 50	电压环Kc（抗积分饱和）
 	50,				//- 51	电压环PWM闭环攀升
 	50,				//- 52	电压环PWM闭环下降
 	
@@ -268,7 +268,11 @@ void YS500msCtl(void){
 	
 }
 
-//有刷PI初始化函数
+/*
+ * 函数功能：按当前有刷通道装载速度环和电压环参数，并清除上一次运行遗留的积分状态。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void YSPI_Init(void){
 	
 	if(App2.Log.Channel == 3){								//通道1 PID参数
@@ -280,8 +284,10 @@ void YSPI_Init(void){
 		MC_Spd.qOutMin = 0;	
 		MC_Spd.qErrMax = YSPara1[1]*10 / 2.0f;	
 		MC_Spd.qErrMin = -MC_Spd.qErrMax;
-		MC_Spd.qdSumMax = MC_Spd.qOutMax * 1.2f;
-		MC_Spd.qdSumMin = MC_Spd.qOutMax - MC_Spd.qdSumMax;
+		MC_Spd.qdSumMax = MC_Spd.qOutMax; // 积分上限不超过速度环真实电压输出上限。
+		MC_Spd.qdSumMin = MC_Spd.qOutMin; // 积分下限不低于速度环真实电压输出下限。
+		// 通道1每次启动、换向或重新进入运行态时清理历史速度积分。
+		mcLib_InitPI2(&MC_Spd);
 		
 		//电压环
 		MC_VBus.qKp = YSPara1[48];		
@@ -291,8 +297,8 @@ void YSPI_Init(void){
 		MC_VBus.qOutMin = 0;
 		MC_VBus.qErrMax = YSPara1[12] / 10.0f / 2.0f;
 		MC_VBus.qErrMin = -MC_VBus.qErrMax;
-		MC_VBus.qdSumMax = MC_VBus.qOutMax * 1.2f;
-		MC_VBus.qdSumMin = MC_VBus.qOutMax - MC_VBus.qdSumMax;
+		MC_VBus.qdSumMax = MC_VBus.qOutMax; // 积分上限不超过电压环真实PWM输出上限。
+		MC_VBus.qdSumMin = MC_VBus.qOutMin; // 积分下限不低于电压环真实PWM输出下限。
 		mcLib_InitPI2(&MC_VBus);	
 
 	}else if(App2.Log.Channel == 4){												//通道2 PID参数
@@ -304,8 +310,8 @@ void YSPI_Init(void){
 		MC_Spd.qOutMin = 0;
 		MC_Spd.qErrMax = YSPara2[1]*10 / 2.0f;
 		MC_Spd.qErrMin = -MC_Spd.qErrMax;
-		MC_Spd.qdSumMax = MC_Spd.qOutMax * 1.2f;
-		MC_Spd.qdSumMin = MC_Spd.qOutMax - MC_Spd.qdSumMax;
+		MC_Spd.qdSumMax = MC_Spd.qOutMax; // 积分上限不超过速度环真实电压输出上限。
+		MC_Spd.qdSumMin = MC_Spd.qOutMin; // 积分下限不低于速度环真实电压输出下限。
 		mcLib_InitPI2(&MC_Spd);
 		
 		//电压环
@@ -316,8 +322,8 @@ void YSPI_Init(void){
 		MC_VBus.qOutMin = 0;
 		MC_VBus.qErrMax = YSPara2[12] / 10.0f / 2.0f;
 		MC_VBus.qErrMin = -MC_VBus.qErrMax;
-		MC_VBus.qdSumMax = MC_VBus.qOutMax * 1.2f;
-		MC_VBus.qdSumMin = MC_VBus.qOutMax - MC_VBus.qdSumMax;
+		MC_VBus.qdSumMax = MC_VBus.qOutMax; // 积分上限不超过电压环真实PWM输出上限。
+		MC_VBus.qdSumMin = MC_VBus.qOutMin; // 积分下限不低于电压环真实PWM输出下限。
 		mcLib_InitPI2(&MC_VBus);		
 	}
 }
@@ -351,34 +357,56 @@ void mcLib_InitPI2( mcParam_PIController2 *pParam){
 	
 }
 
-//PI运算函数
-void mcLib_CalcPI2( mcParam_PIController2 *pParam){
-	float U;
-	float Exc;
-	
-	pParam->qErr  = pParam->qInRef - pParam->qInMeas; 
-	
+/*
+ * 函数功能：计算有刷速度环或电压环PI，并通过方向条件积分和反算项抑制积分饱和。
+ * 输入参数：pParam为当前速度环或电压环的PI参数及运行状态。
+ * 返回参数：无。
+ */
+void mcLib_CalcPI2(mcParam_PIController2 *pParam){
+	float U; // 保存积分项与比例项相加后的未限幅输出。
+	float Exc; // 保存未限幅输出与真实限幅输出之间的饱和差值。
+	uint8_t allowIntegral; // 标记当前误差方向是否允许继续累加积分。
+
+	// 计算参考值与反馈值之间的闭环误差。
+	pParam->qErr = pParam->qInRef - pParam->qInMeas;
+
+	// 限制参与PI运算的正向误差，避免异常反馈瞬间产生过大的比例输出。
 	if(pParam->qErr > pParam->qErrMax){
 		pParam->qErr = pParam->qErrMax;
+	// 限制参与PI运算的反向误差，保持正反方向处理对称。
 	}else if(pParam->qErr < pParam->qErrMin){
 		pParam->qErr = pParam->qErrMin;
 	}
-	
-	U  = pParam->qdSum + pParam->qKp * pParam->qErr;
-	
-	if( U > pParam->qOutMax ){
-			pParam->qOut = pParam->qOutMax;
-	}else if( U < pParam->qOutMin ){
-			pParam->qOut = pParam->qOutMin;
+
+	// 先计算未限幅输出，用于判断执行器是否已经进入饱和区。
+	U = pParam->qdSum + pParam->qKp * pParam->qErr;
+
+	// 上限饱和时只输出执行器允许的最大值。
+	if(U > pParam->qOutMax){
+		pParam->qOut = pParam->qOutMax;
+	// 下限饱和时只输出执行器允许的最小值。
+	}else if(U < pParam->qOutMin){
+		pParam->qOut = pParam->qOutMin;
 	}else{
-			pParam->qOut = U;  
+		pParam->qOut = U; // 未饱和时直接采用PI计算结果。
 	}
-	
-	Exc = U - pParam->qOut;
-	pParam->qdSum = pParam->qdSum + pParam->qKi * pParam->qErr - pParam->qKc * Exc;
-	
+
+	allowIntegral = 1U; // 默认允许积分，以便消除稳定运行时的静差。
+	if(((pParam->qOut >= pParam->qOutMax) && (pParam->qErr > 0.0f)) ||
+	   ((pParam->qOut <= pParam->qOutMin) && (pParam->qErr < 0.0f))){
+		allowIntegral = 0U; // 输出已饱和且误差继续推动同一方向时禁止积分继续堆积。
+	}
+
+	Exc = U - pParam->qOut; // 计算饱和差值，供Kc反算释放已经形成的历史积分。
+	if(allowIntegral != 0U){
+		pParam->qdSum += pParam->qKi * pParam->qErr; // 仅在未继续推向饱和时累加积分。
+	}
+	pParam->qdSum -= pParam->qKc * Exc; // Kc大于0时把限幅差反算回积分器，加快退出饱和区。
+
+	// 最终积分不得超过执行器真实上限，避免保存无法输出的隐藏积分。
 	if(pParam->qdSum > pParam->qdSumMax){
 		pParam->qdSum = pParam->qdSumMax;
+	// 积分也不得低于执行器真实下限，避免恢复负载时出现额外迟滞。
 	}else if(pParam->qdSum < pParam->qdSumMin){
 		pParam->qdSum = pParam->qdSumMin;
 	}
