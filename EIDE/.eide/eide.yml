@@ -109,7 +109,8 @@ virtualFolder:
       folders: []
 dependenceList: []
 outDir: build
-miscInfo: {}
+miscInfo:
+  uid: 9aa9a1f8ce39a3043355692a502e334b
 targets:
   AT32F403A_FOC:
     cppPreprocessAttrs:
@@ -125,7 +126,6 @@ targets:
         - ../Libraries/CMSIS/CM4/CoreSupport
         - ../Libraries/CMSIS/CM4/DeviceSupport
         - ../MotorCode
-        - ../USER
         - ../UserCode
         - ../YouShua
         - .cmsis/include
@@ -243,8 +243,8 @@ targets:
         baseAddr: ""
         bin: ""
         cpuInfo:
-          cpuName: "null"
-          vendor: "null"
+          cpuName: AT32F403ARCT7
+          vendor: ArteryTek
         otherCmds: ""
         proType: 1
         speed: 8000
