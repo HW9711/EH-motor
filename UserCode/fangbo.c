@@ -11,7 +11,283 @@
 #include "at32_board.h"
 #include "YSstatemachine.h"
 #include "YSprotect.h"
+#include "mcuart.h" /* 查询外部停止和输出锁定，阻止启动或换相覆盖停机。 */
 
+
+#define HALL_OSC_TIMER_PERIOD_TICKS 50000UL /* TMR5每5ms溢出，保留原10MHz分辨率和其他模式配置。 */
+#define HALL_OSC_NO_EDGE_TICKS 1200000UL /* 120ms无有效霍尔后清测速；覆盖100rpm附近的正常边沿间隔。 */
+#define HALL_OSC_ASSIST_MAX_RPM 3000.0f /* 只给低速有霍尔往复助力，覆盖500刀具转速经常用减速比换算后的目标。 */
+#define HALL_OSC_ASSIST_TICKS 120U /* 500us控制周期累计60ms；每次启动助力只能执行一次。 */
+#define HALL_OSC_ASSIST_FIRST_PWM 600U /* 首段助力目标约8%，仍经过原PWM爬坡限制。 */
+#define HALL_OSC_ASSIST_MAX_PWM 1200U /* 助力阶段最多约16%，并受原通道PWM上限约束。 */
+#define HALL_OSC_ASSIST_PWM_STEP 20U /* 每500us增减助力20计数，限制静止启动和电流回退的变化量。 */
+
+typedef struct
+{
+    uint32_t period[6]; /* 最近六个有效霍尔间隔，保持一电周期平均测速。 */
+    uint32_t sum; /* 当前有效间隔总计数，单位0.1us。 */
+    volatile uint8_t samples; /* 本次启动已有的有效间隔数；至少两个才允许发布速度。 */
+    uint8_t index; /* 六个间隔的循环写入位置。 */
+    uint8_t last_hall; /* 独立保存真实霍尔码，不使用ADC中预测补偿过的码。 */
+    uint16_t assist_ticks; /* 本次启动已经使用的500us助力节拍。 */
+    uint16_t assist_pwm; /* 助力自身的受限PWM目标。 */
+    uint8_t assist_active; /* 仅初始化时允许启动助力，运行中失速不自动重新触发。 */
+} HallOscState;
+
+static HallOscState s_hall_osc[2]; /* A/B分别保存测速与助力状态，切换通道不复用旧数据。 */
+static volatile uint32_t s_hall_osc_overflow_ticks; /* 单个活动通道共用TMR5的累计溢出时间。 */
+
+/*
+ * 函数功能：限定新增逻辑仅处理无刷有霍尔电气往复，其他模式保留原控制路径。
+ * 输入参数：无。
+ * 返回参数：1表示启用有霍尔往复修正，0表示使用原路径。
+ */
+static uint8_t HallOsc_IsEnabled(void)
+{
+    return (uint8_t)((YSorWSFlag == 1U) && (App.Logic.CtlMode == 3U) &&
+                     (App.Logic.LogicHall_or_pll == 2U)); /* PXBA/PXBB电气往复由主控选择此模式。 */
+}
+
+/*
+ * 函数功能：丢弃不连续或超时的霍尔测速历史，避免旧速度进入新一轮启动。
+ * 输入参数：state为本路往复状态；motor为本路无刷运行状态。
+ * 返回参数：无。
+ */
+static void HallOsc_Invalidate(HallOscState *state, FANGBO_TYPEDEF *motor)
+{
+    state->samples = 0U; /* 撤销有效性，重新收集连续霍尔间隔。 */
+    state->index = 0U; /* 新一轮从环形缓冲首项写入。 */
+    state->sum = 0U; /* 丢弃上一方向或异常之前的累计时间。 */
+    state->last_hall = 0U; /* 下一有效边沿只建立计时基准，不把等待时间当成转动时间。 */
+    motor->Hall_Timer_Sum_Now = 0U; /* 旧周期值不再提供给速度环。 */
+    motor->Spd_Enable = 1.0f; /* ADC在收到本轮有效测速前按零速处理。 */
+}
+
+/*
+ * 函数功能：首次启动和每次换向分别复位霍尔测速，并为低速往复准备一次有限助力。
+ * 输入参数：channel为无刷通道编号1或2。
+ * 返回参数：无。
+ */
+static void HallOsc_Reset(uint8_t channel)
+{
+    HallOscState *state = &s_hall_osc[channel - 1U]; /* 调用点固定传入本路编号。 */
+    FANGBO_TYPEDEF *motor = (channel == 1U) ? &App.FB : &App.FB2; /* 仅复位当前启动的通道。 */
+    uint32_t saved_mask; /* 保存进入前的中断状态，不能擅自打开原已屏蔽的中断。 */
+    if (HallOsc_IsEnabled() == 0U)
+    {
+        state->assist_active = 0U; /* 单向、无霍尔和定位模式不使用启动助力。 */
+        return; /* 不改变其他模式的计时器和测速历史。 */
+    }
+    saved_mask = __get_PRIMASK(); /* 防止霍尔边沿与软件复位交叉更新同一计数。 */
+    __disable_irq(); /* 仅在清理计数与标志期间屏蔽中断。 */
+    HallOsc_Invalidate(state, motor); /* 清本次换向之前的有效测速。 */
+    motor->Cyc_Hall = 0U; /* 清兼容计数，避免旧六边沿累计残留。 */
+    motor->Hall_Timer_Cnt = 0U; /* 清旧的单边沿间隔。 */
+    motor->Hall_Timer_Sum = 0U; /* 清旧周期总计数。 */
+    motor->Spd_Now = 0.0f; /* 启动时不得向保护和控制环发布上一方向的速度。 */
+    motor->Rad_Now = 0.0f; /* 角速度与转速同时失效。 */
+    s_hall_osc_overflow_ticks = 0U; /* 从本次启动重新累计TMR5溢出。 */
+    TMR_SetCounter(TMR5, 0U); /* 清硬件计数，与软件高位保持同一基准。 */
+    TMR_ClearITPendingBit(TMR5, TMR_INT_Overflow); /* 旧溢出不能计入新启动。 */
+    state->assist_ticks = 0U; /* 每次合法启动重新拥有有限的60ms助力窗口。 */
+    state->assist_pwm = HALL_OSC_ASSIST_FIRST_PWM; /* 助力从受限的小占空比目标开始爬升。 */
+    state->assist_active = (uint8_t)((motor->Spd_Set > 0.0f) &&
+                                    (motor->Spd_Set <= HALL_OSC_ASSIST_MAX_RPM)); /* 高频往复高转速保持原速度PI。 */
+    __set_PRIMASK(saved_mask); /* 恢复原中断状态。 */
+}
+
+/*
+ * 函数功能：累计有霍尔往复的TMR5溢出，并将真正长期无边沿的测速置为无效。
+ * 输入参数：无。
+ * 返回参数：1表示已处理往复分支，0表示中断继续执行原模式逻辑。
+ */
+uint8_t HallOsc_TimerOverflow(void)
+{
+    uint32_t saved_mask; /* 溢出与霍尔捕获必须原子地交换高位计数。 */
+    uint8_t channel = App.Logic.Motor_Kind; /* 计时器只属于当前活动无刷通道。 */
+    if (HallOsc_IsEnabled() == 0U)
+    {
+        return 0U; /* 其他模式保留原溢出处理。 */
+    }
+    saved_mask = __get_PRIMASK(); /* 保存调用现场的屏蔽状态。 */
+    __disable_irq(); /* 防止更高优先级霍尔中断重复统计同一溢出。 */
+    if (TMR_GetINTStatus(TMR5, TMR_INT_Overflow) == SET) /* 捕获中断可能已经消费过该待处理溢出。 */
+    {
+        TMR_ClearITPendingBit(TMR5, TMR_INT_Overflow); /* 清标志和累计高位必须在同一临界区完成。 */
+        if (s_hall_osc_overflow_ticks < HALL_OSC_NO_EDGE_TICKS)
+        {
+            s_hall_osc_overflow_ticks += HALL_OSC_TIMER_PERIOD_TICKS; /* 补上硬件回卷丢失的5ms。 */
+        }
+        if ((s_hall_osc_overflow_ticks >= HALL_OSC_NO_EDGE_TICKS) &&
+            ((channel == 1U) || (channel == 2U)))
+        {
+            HallOsc_Invalidate(&s_hall_osc[channel - 1U],
+                               (channel == 1U) ? &App.FB : &App.FB2); /* 真正无边沿时恢复零速，原堵转保护继续计时。 */
+        }
+    }
+    __set_PRIMASK(saved_mask); /* 不改变调用前的中断许可。 */
+    return 1U; /* 往复分支不能再使用原5ms即清零的规则。 */
+}
+
+/*
+ * 函数功能：捕获本路真实霍尔边沿，补偿计时器溢出并生成启动期有效测速。
+ * 输入参数：channel为触发霍尔中断的无刷通道编号1或2。
+ * 返回参数：1表示本边沿已处理或丢弃，0表示调用者使用原模式的测速逻辑。
+ */
+uint8_t HallOsc_CaptureEdge(uint8_t channel)
+{
+    HallOscState *state; /* 本路独立的测速历史。 */
+    FANGBO_TYPEDEF *motor; /* 本路原速度环与保护共享的反馈。 */
+    uint32_t saved_mask; /* 保存捕获前的中断屏蔽状态。 */
+    uint32_t elapsed; /* 本边沿距离上一边沿的完整0.1us计数。 */
+    uint32_t counter; /* TMR5尚未溢出的低位计数。 */
+    uint8_t hall; /* 直接采样的三位霍尔码。 */
+    uint8_t expected; /* 当前方向允许出现的下一个霍尔码。 */
+    if (HallOsc_IsEnabled() == 0U)
+    {
+        return 0U; /* 单向和定位等模式保持原实现。 */
+    }
+    if (((channel != 1U) && (channel != 2U)) || (channel != App.Logic.Motor_Kind))
+    {
+        return 1U; /* 非活动通道的迟到中断不能清共用计时器。 */
+    }
+    state = &s_hall_osc[channel - 1U]; /* 在通道校验后访问本路状态。 */
+    motor = (channel == 1U) ? &App.FB : &App.FB2; /* 只写当前实际运行的无刷反馈。 */
+    if ((motor->AllRun == 0U) || (motor->Status != HS_RUN) || (motor->Err != E_NONE))
+    {
+        return 1U; /* 预充电、制动和故障期间的边沿不得建立新运行测速。 */
+    }
+    hall = (channel == 1U) ? gethall : gethall2; /* 不能用ADC人为补齐的换相码测速。 */
+    if ((hall == 0U) || (hall == 7U))
+    {
+        HallOsc_Invalidate(state, motor); /* 非法霍尔码立即撤销测速有效性。 */
+        return 1U; /* 保留原故障处理，不生成虚假的转速。 */
+    }
+    if (hall == state->last_hall)
+    {
+        return 1U; /* 重复边沿不清计时器，避免将抖动误当成高速运动。 */
+    }
+    saved_mask = __get_PRIMASK(); /* 软件高位、低位和待处理溢出必须一致。 */
+    __disable_irq(); /* 捕获临界区只包含计数读取和基准复位。 */
+    elapsed = s_hall_osc_overflow_ticks; /* 读取已经由溢出中断累计的完整周期。 */
+    counter = TMR_GetCounter(TMR5); /* 先读取当前低位，随后检查尚未服务的回卷。 */
+    if (TMR_GetINTStatus(TMR5, TMR_INT_Overflow) == SET)
+    {
+        counter = TMR_GetCounter(TMR5); /* 发生回卷时重新读低位，不能混用回卷前的数值。 */
+        elapsed += HALL_OSC_TIMER_PERIOD_TICKS; /* 捕获中断先于溢出中断执行时自行补一次高位。 */
+    }
+    elapsed += counter; /* 合成为完整边沿间隔。 */
+    s_hall_osc_overflow_ticks = 0U; /* 下一间隔从零累计高位。 */
+    TMR_SetCounter(TMR5, 0U); /* 同步复位硬件低位。 */
+    TMR_ClearITPendingBit(TMR5, TMR_INT_Overflow); /* 已计入的溢出不能在退出后再次累计。 */
+    __set_PRIMASK(saved_mask); /* 立即恢复原中断状态。 */
+    if (state->last_hall == 0U)
+    {
+        state->last_hall = hall; /* 首个边沿只建立运动时间基准，排除预充电和静止等待。 */
+        return 1U; /* 不能把首个不完整扇区用于速度闭环。 */
+    }
+    expected = (motor->Dir.Now == CW) ? NextCCWhall[state->last_hall] : NextCWhall[state->last_hall]; /* 与原实际换相顺序一致。 */
+    if ((hall != expected) || (elapsed == 0U) || (elapsed >= HALL_OSC_NO_EDGE_TICKS))
+    {
+        HallOsc_Invalidate(state, motor); /* 反向惯性、跳码或超时必须重新建立连续测速。 */
+        state->last_hall = hall; /* 当前合法霍尔码作为下一完整间隔的基准。 */
+        return 1U; /* 不向速度环提交不可信的速度。 */
+    }
+    state->last_hall = hall; /* 保存本次真实码，供下一边沿检查顺序。 */
+    if (state->samples < 6U)
+    {
+        ++state->samples; /* 启动时逐步收集样本，不必等待完整一圈才计算平均值。 */
+    }
+    else
+    {
+        state->sum -= state->period[state->index]; /* 样本齐全后移除最旧扇区时间。 */
+    }
+    state->period[state->index] = elapsed; /* 当前间隔替换环形缓冲对应项。 */
+    state->sum += elapsed; /* 累加有效扇区的真实时间。 */
+    state->index = (uint8_t)((state->index + 1U) % 6U); /* 六个扇区形成稳定的一电周期滑动平均。 */
+    motor->Hall_Timer_Cnt = elapsed; /* 保留完整边沿时间供原运行状态读取。 */
+    motor->Hall_Timer_Sum_Now = (state->sum * 6U) / state->samples; /* 归一为六扇区总时间，保留原10MHz测速公式。 */
+    motor->Spd_Enable = (state->samples >= 2U) ? 0.0f : 1.0f; /* 至少两个连续正确间隔才发布本次测速。 */
+    return 1U; /* 本边沿已处理，调用者不得再清计时器或叠加旧周期。 */
+}
+
+/*
+ * 函数功能：为低速有霍尔往复建立一次受限起动力矩，并把实际输出平滑交给速度PI。
+ * 输入参数：channel为通道1或2；requested_pwm为本周期原速度PI输出。
+ * 返回参数：受启动期限、原PWM上限和原保护电流约束后的PWM目标。
+ */
+static int32_t HallOsc_ApplyStartupAssist(uint8_t channel, int32_t requested_pwm)
+{
+    HallOscState *state = &s_hall_osc[channel - 1U]; /* 两路助力期限分别计数。 */
+    FANGBO_TYPEDEF *motor = (channel == 1U) ? &App.FB : &App.FB2; /* 使用本路速度和保护电流。 */
+    mcParam_PIController *pi = (channel == 1U) ? &mcApp_VoltageP_PIParam : &mcApp_VoltageP_PIParam2; /* 回填本路PI，避免切环瞬间掉力。 */
+    int32_t limit = HALL_OSC_ASSIST_MAX_PWM; /* 助力绝不直接使用速度环的满量程输出。 */
+    if ((state->assist_active == 0U) || (HallOsc_IsEnabled() == 0U))
+    {
+        return requested_pwm; /* 未启用助力的运行路径逐值保持原PI结果。 */
+    }
+    if ((motor->Start == 0U) || (motor->AllRun == 0U) || (motor->Status != HS_RUN) ||
+        (motor->Err != E_NONE) || (App.Logic.Brake_Sign != 0U) ||
+        (MotorCommand_IsStopRequested() != 0U) || (MotorCommand_IsOutputLocked() != 0U) ||
+        (motor->Spd_Set <= 0.0f) || (motor->Spd_Set > HALL_OSC_ASSIST_MAX_RPM) ||
+        (motor->Prot.OverCurrent <= 0.0f))
+    {
+        state->assist_active = 0U; /* 停机、故障、换模式或无有效电流门限立即撤销助力。 */
+        return requested_pwm; /* 输出关断仍由已有停机与保护路径优先执行。 */
+    }
+    if ((state->assist_ticks >= HALL_OSC_ASSIST_TICKS) ||
+        ((state->samples >= 2U) && (fabsf(motor->Spd_Now) >= motor->Spd_Set * 0.6f)))
+    {
+        state->assist_active = 0U; /* 转子已经建立运动或助力到期后，本次运行不再重新触发。 */
+        return requested_pwm; /* 前次已回填PI积分，正常速度环连续接管。 */
+    }
+    ++state->assist_ticks; /* 每次只消耗一个500us启动节拍。 */
+    if (pi->qOutMax < (float)limit)
+    {
+        limit = (int32_t)pi->qOutMax; /* 原通道PWM上限比助力上限更小时仍以原上限为准。 */
+    }
+    if ((limit <= 0) || (pi->qOutMin > (float)limit))
+    {
+        state->assist_active = 0U; /* 不覆盖已有的特殊PWM范围配置。 */
+        return requested_pwm; /* 保留原配置行为。 */
+    }
+    if (motor->Prot.AllCur >= motor->Prot.OverCurrent * 0.8f)
+    {
+        requested_pwm = App.Logic.VBusNowPWM - (int32_t)HALL_OSC_ASSIST_PWM_STEP; /* 接近原保护电流时先减力，保护门限本身不变。 */
+        if (requested_pwm < 0)
+        {
+            requested_pwm = 0; /* 电流回退不能产生负PWM。 */
+        }
+        state->assist_pwm = (uint16_t)requested_pwm; /* 助力缓存跟随回退值，下一周期不能恢复旧高输出。 */
+    }
+    else
+    {
+        state->assist_pwm += HALL_OSC_ASSIST_PWM_STEP; /* 在短启动窗口内逐步建立克服静摩擦的输出。 */
+        if (state->assist_pwm > (uint16_t)limit)
+        {
+            state->assist_pwm = (uint16_t)limit; /* 助力爬升不能越过本次有效上限。 */
+        }
+        if (requested_pwm < (int32_t)state->assist_pwm)
+        {
+            requested_pwm = state->assist_pwm; /* 启动期给速度PI提供受限的输出下限。 */
+        }
+    }
+    if (requested_pwm > limit)
+    {
+        requested_pwm = limit; /* 助力期间的最终目标也必须受上限约束。 */
+    }
+    pi->qdSum = (float)requested_pwm - pi->qKp * pi->qErr; /* 以本次实际目标回填积分，退出助力时避免掉回零输出。 */
+    if (pi->qdSum < 0.0f)
+    {
+        pi->qdSum = 0.0f; /* 与原PI的非负积分约束保持一致。 */
+    }
+    if (pi->qdSum > pi->qdSumMax)
+    {
+        pi->qdSum = pi->qdSumMax; /* 不放宽原积分上限。 */
+    }
+    pi->qOut = (float)requested_pwm; /* PI输出状态与即将下发的受限目标保持一致。 */
+    return requested_pwm; /* 仍由原PWM爬坡和硬件写入路径执行。 */
+}
 
 //132645 
 uint8_t NextCCWhall[7] = {
@@ -71,6 +347,11 @@ const uint8_t RAMP_TABLE_Hall[7] = {
 
 
 //方波ADC中断服务函数 
+/*
+ * 函数功能：采样并换相；有霍尔往复只接受真实捕获确认的速度，保留其他模式原反馈路径。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void HallSqu_ADCISRTasks(void){
 	volatile short phaseVolP = 0;					//采取电压
 	volatile uint8_t i = 0;								//速度读取用
@@ -162,7 +443,10 @@ void HallSqu_ADCISRTasks(void){
 		App.FB.HallVal = gethall;			//获取Hall值
 		if((App.FB.HallVal !=0)&&(App.FB.HallVal !=7)){			//判定霍尔的值不为0和7才给他判定方向
 			if((App.FB.HallVal != App.FB.OldHallVal)&&(App.FB.OldHallVal !=0)){
-				App.FB.Spd_Enable =0;
+				if (App.Logic.CtlMode != 3U) /* 往复测速有效性由真实霍尔捕获维护，ADC预测换相不能提前放行。 */
+                {
+                    App.FB.Spd_Enable =0; /* 单向模式保留原换相恢复测速行为。 */
+                }
 			}
 		}
 		//预判Hall处理，防止干扰打断Hall,需要校验本次的HallVal是否正确，如果不正确，那么需要在换向前，替换掉错误的
@@ -228,7 +512,10 @@ void HallSqu_ADCISRTasks(void){
 	App.FB2.HallVal = gethall2;
 	if((App.FB2.HallVal !=0)||(App.FB2.HallVal!=7)){			//判定霍尔的值不为0和7才给他判定方向
 			if((App.FB2.HallVal != App.FB2.OldHallVal)&&(App.FB2.OldHallVal !=0)){
-				App.FB2.Spd_Enable =0;
+				if (App.Logic.CtlMode != 3U) /* 往复测速有效性由真实霍尔捕获维护，ADC预测换相不能提前放行。 */
+                {
+                    App.FB2.Spd_Enable =0; /* 单向模式保留原换相恢复测速行为。 */
+                }
 			}
 		}
 	
@@ -391,6 +678,11 @@ void Fangbo_Init(void){
 
 
 //	根据速度去电压闭环
+/*
+ * 函数功能：执行A路原速度PI与PWM爬坡，仅低速有霍尔往复增加受限启动助力。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void Hall_Vbus_PI_Out(void){
 	volatile int32_t temp_pwm = 0;
 	
@@ -420,6 +712,7 @@ void Hall_Vbus_PI_Out(void){
 
 			//输出值给temp；
 				temp_pwm = (uint16_t)mcApp_VoltageP_PIParam.qOut;
+                temp_pwm = HallOsc_ApplyStartupAssist(1U, temp_pwm); /* 低速往复短时建立起动力矩，随后由原PI连续接管。 */
 			//给定期望值，但是需要爬坡
 				App.Logic.VBusSetPWM = temp_pwm;
 
@@ -451,6 +744,11 @@ void Hall_Vbus_PI_Out(void){
 
 
 //	根据速度去电压闭环
+/*
+ * 函数功能：执行B路原速度PI与PWM爬坡，仅低速有霍尔往复增加受限启动助力。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void Hall_Vbus_PI_Out2(void){
 	volatile int32_t temp_pwm = 0;
 	float PWM_UP2 	 = 0;
@@ -478,6 +776,7 @@ void Hall_Vbus_PI_Out2(void){
 		mcLib_CalcPI(&mcApp_VoltageP_PIParam2);
 		//输出值给temp；
 		temp_pwm = (uint16_t)mcApp_VoltageP_PIParam2.qOut;
+                temp_pwm = HallOsc_ApplyStartupAssist(2U, temp_pwm); /* 低速往复短时建立起动力矩，随后由原PI连续接管。 */
 		
 		//给定期望值，但是需要爬坡
 		App.Logic.VBusSetPWM = temp_pwm;
@@ -565,8 +864,30 @@ void HallSqu_Wait2(void){
 
 
 //初始化
+/*
+ * 函数功能：处理无刷A路启动初始化，停止请求可以在产生后续输出前取消启动
+ * 输入参数：无。
+ * 返回参数：无。
+ */
+/*
+ * 函数功能：初始化A路无刷启动；有霍尔往复分别复位测速与助力，其他模式保持原流程。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void HallSqu_Init(void){
 	uint8_t i = 0;
+    if ((App.FB.Start == 0U) || (MotorCommand_IsStopRequested() != 0U))
+    {
+        App.FB.AllRun = 0U; /* 启动许可已经撤销，预充电不能继续进入开环。 */
+        App.FB.Status = HS_WAIT; /* 本通道直接退出尚未完成的启动阶段。 */
+        App.Logic.VBusNowPWM = 0; /* 清启动阶段已经写入的母线值。 */
+        TMR_SetCompare4(TMR2, 0U); /* 撤销实际启动供能。 */
+        PWM_3l_Stop(); /* 关闭本通道上下桥，避免松脚后补发启动脉冲。 */
+        return; /* 不再执行下方任何启动硬件访问。 */
+    }
+    App.Logic.Brake_StopPwmOK = 0U; /* 每次真正重新启动都清除旧制动结果。 */
+    App.Logic.Brake_StopTimOK = 0U; /* 不继承上次切换等待结果。 */
+
 
 	TIME1_PWM_Stop_3Channel();		//防止有刷一起转
 	TIME8_PWM_Stop_3Channel();		//防止有刷一起转
@@ -597,6 +918,7 @@ void HallSqu_Init(void){
 		}
 		//速度PI初始化
 		VoltageP1_Init();
+        HallOsc_Reset(1U); /* 本次有霍尔往复清测速历史并准备有限启动助力；其他模式只撤销助力。 */
 	}else if (App.Logic.CtlMode == 4 ||App.Logic.CtlMode ==5){
 		HALL1_GPIO_INIT();			//有霍尔的话初始化HALL
 		TIM3_DISABLE();	
@@ -636,8 +958,25 @@ void HallSqu_Init(void){
 
 
 //初始化
+/*
+ * 函数功能：处理无刷B路启动初始化，停止请求可以在产生后续输出前取消启动
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void HallSqu_Init2(void){
 	uint8_t i = 0;
+    if ((App.FB2.Start == 0U) || (MotorCommand_IsStopRequested() != 0U))
+    {
+        App.FB2.AllRun = 0U; /* 启动许可已经撤销，预充电不能继续进入开环。 */
+        App.FB2.Status = HS_WAIT; /* 本通道直接退出尚未完成的启动阶段。 */
+        App.Logic.VBusNowPWM = 0; /* 清启动阶段已经写入的母线值。 */
+        TMR_SetCompare4(TMR2, 0U); /* 撤销实际启动供能。 */
+        PWM_3l_Stop2(); /* 关闭本通道上下桥，避免松脚后补发启动脉冲。 */
+        return; /* 不再执行下方任何启动硬件访问。 */
+    }
+    App.Logic.Brake_StopPwmOK = 0U; /* 每次真正重新启动都清除旧制动结果。 */
+    App.Logic.Brake_StopTimOK = 0U; /* 不继承上次切换等待结果。 */
+
 	TIME1_PWM_Stop_3Channel();		//防止有刷一起转
 	TIME8_PWM_Stop_3Channel();		//防止有刷一起转
 	PVCC_PWM_ON;
@@ -668,6 +1007,7 @@ void HallSqu_Init2(void){
 		}
 		//速度PI初始化
 		VoltageP2_Init();
+        HallOsc_Reset(2U); /* 本次有霍尔往复清测速历史并准备有限启动助力；其他模式只撤销助力。 */
 	}else if (App.Logic.CtlMode == 4 ||App.Logic.CtlMode ==5){
 		HALL2_GPIO_INIT();			//有霍尔的话初始化HALL
 		TIM3_DISABLE();	
@@ -705,7 +1045,22 @@ void HallSqu_Init2(void){
 
 
 //充电
+/*
+ * 函数功能：处理无刷A路预充电，停止请求可以在产生后续输出前取消启动
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void HallSqu_Charge(void){
+    if ((App.FB.Start == 0U) || (MotorCommand_IsStopRequested() != 0U) || (App.FB.Err != E_NONE))
+    {
+        App.FB.AllRun = 0U; /* 预充电取消后不能再进入开环或闭环运行。 */
+        App.FB.Status = (App.FB.Err == E_NONE) ? HS_WAIT : HS_ERR; /* 退出本通道启动流程，保留已有保护错误。 */
+        App.Logic.VBusNowPWM = 0; /* 清除启动阶段遗留的母线目标。 */
+        TMR_SetCompare4(TMR2, 0U); /* 松脚发生在预充电阶段也立即关闭BUCK。 */
+        PWM_3l_Stop(); /* 关闭当前通道桥臂，禁止后续充电分支再次打开。 */
+        return; /* 不执行预充电完成后的启动动作。 */
+    }
+
 	if(App.FB.ChaTim1msFg == 1){
 		App.FB.ChaTim1msFg = 0;
 		App.FB.ChaTim1msCnt ++;
@@ -788,13 +1143,28 @@ void HallSqu_Charge(void){
 
 
 //充电
+/*
+ * 函数功能：处理无刷B路预充电，停止请求可以在产生后续输出前取消启动
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void HallSqu_Charge2(void){
+    if ((App.FB2.Start == 0U) || (MotorCommand_IsStopRequested() != 0U) || (App.FB2.Err != E_NONE))
+    {
+        App.FB2.AllRun = 0U; /* 预充电取消后不能再进入开环或闭环运行。 */
+        App.FB2.Status = (App.FB2.Err == E_NONE) ? HS_WAIT : HS_ERR; /* 退出本通道启动流程，保留已有保护错误。 */
+        App.Logic.VBusNowPWM = 0; /* 清除启动阶段遗留的母线目标。 */
+        TMR_SetCompare4(TMR2, 0U); /* 松脚发生在预充电阶段也立即关闭BUCK。 */
+        PWM_3l_Stop2(); /* 关闭当前通道桥臂，禁止后续充电分支再次打开。 */
+        return; /* 不执行预充电完成后的启动动作。 */
+    }
+
 	if(App.FB2.ChaTim1msFg == 1){
 		App.FB2.ChaTim1msFg = 0;
 		
 		App.FB2.ChaTim1msCnt ++;
 		if(App.FB2.ChaTim1msCnt < 10){
-			PWM1H_OFF;
+			PWM1H_OFF2; /* B路预充电只能操作B路桥臂。 */
 			PWM1L_ON2;
 			PWM2H_OFF2;
 			PWM2L_OFF2;
@@ -867,7 +1237,18 @@ void HallSqu_Charge2(void){
 }
 
 //启动开环，无感方波专用
-void HallSqu_Start(void){					//没有开环，那就直接转闭环
+/*
+ * 函数功能：在启动许可仍有效时执行无刷A路开环爬坡，松脚先转入制动
+ * 输入参数：无。
+ * 返回参数：无。
+ */
+void HallSqu_Start(void){
+    if ((App.FB.Start == 0U) || (MotorCommand_IsStopRequested() != 0U))
+    {
+        App.FB.Status = HS_BRA; /* 开环爬坡前先响应停止，交给原制动斜率撤销输出。 */
+        return; /* 本周期不能再增加启动PWM或发布闭环运行。 */
+    }
+					//没有开环，那就直接转闭环
 	if(App.Logic.LogicHall_or_pll == 1 ){
 		if(App.FB.OpenLoop.OpenStart1msFg == 1){
 			App.FB.OpenLoop.OpenStart1msFg = 0;
@@ -945,7 +1326,18 @@ void HallSqu_Start(void){					//没有开环，那就直接转闭环
 }
 
 //通道2启动
-void HallSqu_Start2(void){					//没有开环，那就直接转闭环
+/*
+ * 函数功能：在启动许可仍有效时执行无刷B路开环爬坡，松脚先转入制动
+ * 输入参数：无。
+ * 返回参数：无。
+ */
+void HallSqu_Start2(void){
+    if ((App.FB2.Start == 0U) || (MotorCommand_IsStopRequested() != 0U))
+    {
+        App.FB2.Status = HS_BRA; /* 开环爬坡前先响应停止，交给原制动斜率撤销输出。 */
+        return; /* 本周期不能再增加启动PWM或发布闭环运行。 */
+    }
+					//没有开环，那就直接转闭环
 	
 	if(App.Logic.LogicHall_or_pll == 1 ){
 		if(App.FB2.OpenLoop.OpenStart1msFg == 1){
@@ -1102,52 +1494,91 @@ void HallSqu_Drag2(void){
 
 
 //刹车 刹车方式
-void HallSqu_Bra(void){
-	if(App.FB.Bra1msFg == 1){
-		App.FB.Bra1msFg = 0;
-		App.FB.BraTimCnt ++;
-		
-	if((App.Logic.VBusNowPWM < MCPara[45])||(App.Logic.Brake_TimeCnt >=10)){
-			App.Logic.Brake_StopPwmOK=1;
-			App.FB.Status = HS_STOP;
-			App.FB.BraTimCnt = 0;
-			if((App.Logic.CtlMode ==3 )&&(App.Logic.LogicHall_or_pll ==2)){
-				App.FB.Chang_Flag = 1;
-			}
-		}
-	}
-	if(App.FB.Err != E_NONE){
-		App.FB.BraTimCnt = 0;
-		App.FB.AllRun = 0;
-		App.FB.Status = HS_ERR;
-		PWM_3l_Stop();
-	}
+/*
+ * 函数功能：处理无刷A路制动完成，先处理错误，外部停止先关输出再发布完成
+ * 输入参数：无。
+ * 返回参数：无。
+ */
+void HallSqu_Bra(void)
+{
+    if (App.FB.Err != E_NONE)
+    {
+        App.Logic.Brake_StopPwmOK = 0U; /* 错误退出不能遗留一个可被下次停机使用的完成结果。 */
+        App.Logic.Brake_StopTimOK = 0U; /* 清理与本次异常退出相关的旧等待结果。 */
+        App.FB.BraTimCnt = 0; /* 结束本通道制动阶段计时。 */
+        App.FB.AllRun = 0; /* 撤销本通道运行许可。 */
+        App.FB.Status = HS_ERR; /* 错误优先于制动完成，不能在同次调用中先报完成再报错误。 */
+        PWM_3l_Stop(); /* 立即关闭本通道桥臂。 */
+        return; /* 不再执行下方完成标记置位。 */
+    }
+    if (App.FB.Bra1msFg == 1U)
+    {
+        App.FB.Bra1msFg = 0U; /* 消费一次制动检查节拍。 */
+        ++App.FB.BraTimCnt; /* 保留本通道原制动进度计数。 */
+        if ((App.Logic.VBusNowPWM < MCPara[45]) ||
+            ((App.Logic.Brake_Kind == 5U) && (App.Logic.Brake_TimeCnt >= 10U)))
+        {
+            if (App.Logic.Brake_Kind == 1U)
+            {
+                App.Logic.VBusNowPWM = 0; /* 停机到退出阈值后最终清零，不保留阈值以内的旧输出。 */
+                App.Logic.VBusSetPWM = 0; /* 撤销普通控制环残留目标。 */
+                TMR_SetCompare4(TMR2, 0U); /* 先实际关闭BUCK，完成标记不能先于硬件动作。 */
+                PWM_3l_Stop(); /* 同步关闭本通道桥臂，再允许状态扫描应用停止模式。 */
+            }
+            App.FB.Status = HS_STOP; /* 当前状态与完成标记必须属于同一次制动。 */
+            App.FB.BraTimCnt = 0; /* 清理已经结束的制动计时。 */
+            App.Logic.Brake_StopPwmOK = 1U; /* 最后发布完成，外部停机已经完成零输出动作。 */
+            if ((App.Logic.CtlMode == 3U) && (App.Logic.LogicHall_or_pll == 2U))
+            {
+                App.FB.Chang_Flag = 1U; /* 保留有霍尔往复快速换向时跳过预充电的原行为。 */
+            }
+        }
+    }
 }
 
 
 
 //刹车 刹车方式
-void HallSqu_Bra2(void){
-	if(App.FB2.Bra1msFg == 1){
-		App.FB2.Bra1msFg = 0;
-		App.FB2.BraTimCnt ++;
-		
-	if((App.Logic.VBusNowPWM < MCPara2[45])||(App.Logic.Brake_TimeCnt >=10)){
-			App.Logic.Brake_StopPwmOK =1;	
-			App.FB2.Status = HS_STOP;
-			App.FB2.BraTimCnt = 0;
-			if((App.Logic.CtlMode ==3 )&&(App.Logic.LogicHall_or_pll ==2)){
-				App.FB2.Chang_Flag = 1;
-			}
-		}	
-	
-	}
-	if(App.FB2.Err != E_NONE){
-		App.FB2.BraTimCnt = 0;
-		App.FB2.AllRun = 0;
-		App.FB2.Status = HS_ERR;
-		PWM_3l_Stop2();
-	}
+/*
+ * 函数功能：处理无刷B路制动完成，先处理错误，外部停止先关输出再发布完成
+ * 输入参数：无。
+ * 返回参数：无。
+ */
+void HallSqu_Bra2(void)
+{
+    if (App.FB2.Err != E_NONE)
+    {
+        App.Logic.Brake_StopPwmOK = 0U; /* 错误退出不能遗留一个可被下次停机使用的完成结果。 */
+        App.Logic.Brake_StopTimOK = 0U; /* 清理与本次异常退出相关的旧等待结果。 */
+        App.FB2.BraTimCnt = 0; /* 结束本通道制动阶段计时。 */
+        App.FB2.AllRun = 0; /* 撤销本通道运行许可。 */
+        App.FB2.Status = HS_ERR; /* 错误优先于制动完成，不能在同次调用中先报完成再报错误。 */
+        PWM_3l_Stop2(); /* 立即关闭本通道桥臂。 */
+        return; /* 不再执行下方完成标记置位。 */
+    }
+    if (App.FB2.Bra1msFg == 1U)
+    {
+        App.FB2.Bra1msFg = 0U; /* 消费一次制动检查节拍。 */
+        ++App.FB2.BraTimCnt; /* 保留本通道原制动进度计数。 */
+        if ((App.Logic.VBusNowPWM < MCPara2[45]) ||
+            ((App.Logic.Brake_Kind == 5U) && (App.Logic.Brake_TimeCnt >= 10U)))
+        {
+            if (App.Logic.Brake_Kind == 1U)
+            {
+                App.Logic.VBusNowPWM = 0; /* 停机到退出阈值后最终清零，不保留阈值以内的旧输出。 */
+                App.Logic.VBusSetPWM = 0; /* 撤销普通控制环残留目标。 */
+                TMR_SetCompare4(TMR2, 0U); /* 先实际关闭BUCK，完成标记不能先于硬件动作。 */
+                PWM_3l_Stop2(); /* 同步关闭本通道桥臂，再允许状态扫描应用停止模式。 */
+            }
+            App.FB2.Status = HS_STOP; /* 当前状态与完成标记必须属于同一次制动。 */
+            App.FB2.BraTimCnt = 0; /* 清理已经结束的制动计时。 */
+            App.Logic.Brake_StopPwmOK = 1U; /* 最后发布完成，外部停机已经完成零输出动作。 */
+            if ((App.Logic.CtlMode == 3U) && (App.Logic.LogicHall_or_pll == 2U))
+            {
+                App.FB2.Chang_Flag = 1U; /* 保留有霍尔往复快速换向时跳过预充电的原行为。 */
+            }
+        }
+    }
 }
 
 //位置刹车
@@ -1255,7 +1686,15 @@ void HallSqu_Stop2(void){
 }
 
 //错误
+/*
+ * 函数功能：关闭无刷A路错误输出并清理制动结果，恢复后回等待态
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void HallSqu_Err(void){
+    App.Logic.Brake_StopPwmOK = 0U; /* 错误恢复不得把完成标记带到下一次运行。 */
+    App.Logic.Brake_StopTimOK = 0U; /* 同步清除旧等待完成结果。 */
+
 	App.FB.AllRun = 0;
 	App.Logic.VBusNowPWM = 0;			//错误需要清零PWM现在值，防止重启时
 	PWM_3l_Stop();
@@ -1266,7 +1705,15 @@ void HallSqu_Err(void){
 }
 
 //错误
+/*
+ * 函数功能：关闭无刷B路错误输出并清理制动结果，恢复后回等待态
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void HallSqu_Err2(void){
+    App.Logic.Brake_StopPwmOK = 0U; /* 错误恢复不得把完成标记带到下一次运行。 */
+    App.Logic.Brake_StopTimOK = 0U; /* 同步清除旧等待完成结果。 */
+
 	App.FB2.AllRun = 0;
 	App.Logic.VBusNowPWM = 0;			//错误需要清零PWM现在值，防止重启时
 	PWM_3l_Stop2();
@@ -1366,7 +1813,22 @@ void HallSqu_Ctl2(void){
 								// 5 1 3 2 6 4		CCW
 //换相中断			// 5 4 6 2 3 1		CW
 							// AB-AC-BC-BA-CA-CB
-void Hall_PhaseChange(u8 hall_val,u16 pwm){	
+/*
+ * 函数功能：在有效运行或定位状态下执行A路桥臂换相，并防止停机抢占后旧换相重开输出
+ * 输入参数：hall_val为相序，pwm为兼容接口占空比参数。
+ * 返回参数：无。
+ */
+void Hall_PhaseChange(u8 hall_val,u16 pwm){
+    uint32_t primask = __get_PRIMASK(); /* 换相可能被500us停机抢占，检查和桥臂写入必须连成一个短操作。 */
+    __disable_irq(); /* 防止已关断的中断返回后继续执行旧换相指令。 */
+    if ((MotorCommand_IsOutputLocked() != 0U) || (App.FB.Err != E_NONE) ||
+        ((App.FB.AllRun == 0U) && (App.FB.Status != HS_POSBRA) &&
+         !(((App.Logic.CtlMode == 4U) || (App.Logic.CtlMode == 5U)) && (App.FB.Start != 0U))))
+    {
+        __set_PRIMASK(primask); /* 不具备有效运行或定位状态时保持已经关闭的输出。 */
+        return; /* 旧换相不能恢复已完成的停止。 */
+    }
+
 	
 		if(App.FB.Dir.Now == CCW){
 			hall_val = 7 - hall_val;		//反方向
@@ -1473,13 +1935,29 @@ void Hall_PhaseChange(u8 hall_val,u16 pwm){
 
 					break;
 	}
+    __set_PRIMASK(primask); /* 本次桥臂更新结束，恢复ADC和500us控制中断。 */
 }
 
 
 
 
 //换相中断
-void Hall_PhaseChange2(u8 hall_val,u16 pwm){	
+/*
+ * 函数功能：在有效运行或定位状态下执行B路桥臂换相，并防止停机抢占后旧换相重开输出
+ * 输入参数：hall_val为相序，pwm为兼容接口占空比参数。
+ * 返回参数：无。
+ */
+void Hall_PhaseChange2(u8 hall_val,u16 pwm){
+    uint32_t primask = __get_PRIMASK(); /* 换相可能被500us停机抢占，检查和桥臂写入必须连成一个短操作。 */
+    __disable_irq(); /* 防止已关断的中断返回后继续执行旧换相指令。 */
+    if ((MotorCommand_IsOutputLocked() != 0U) || (App.FB2.Err != E_NONE) ||
+        ((App.FB2.AllRun == 0U) && (App.FB2.Status != HS_POSBRA) &&
+         !(((App.Logic.CtlMode == 4U) || (App.Logic.CtlMode == 5U)) && (App.FB2.Start != 0U))))
+    {
+        __set_PRIMASK(primask); /* 不具备有效运行或定位状态时保持已经关闭的输出。 */
+        return; /* 旧换相不能恢复已完成的停止。 */
+    }
+
 	
 		if(App.FB2.Dir.Now == CCW){
 			hall_val = 7 - hall_val;		//反方向
@@ -1585,6 +2063,7 @@ void Hall_PhaseChange2(u8 hall_val,u16 pwm){
 					default:
 					break;
 	}
+    __set_PRIMASK(primask); /* 本次桥臂更新结束，恢复ADC和500us控制中断。 */
 }
 
 
@@ -1630,7 +2109,17 @@ void PWM_3l_Stop2(void){
 }
 
 //全开
+/*
+ * 函数功能：在输出门禁允许时开启无刷A路桥臂并初始化相PWM
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void PWM_3l_Start(void){
+    if ((MotorCommand_IsOutputLocked() != 0U) || (App.FB.Err != E_NONE))
+    {
+        return; /* 上电门禁、失联或停机故障时不能重新开启本通道桥臂。 */
+    }
+
 	PWM1H_ON;
 	PWM1L_ON;
 	PWM2H_ON;
@@ -1642,7 +2131,17 @@ void PWM_3l_Start(void){
 	PWM3(0);
 }
 //全开
+/*
+ * 函数功能：在输出门禁允许时开启无刷B路桥臂并初始化相PWM
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void PWM_3l_Start2(void){
+    if ((MotorCommand_IsOutputLocked() != 0U) || (App.FB2.Err != E_NONE))
+    {
+        return; /* 上电门禁、失联或停机故障时不能重新开启本通道桥臂。 */
+    }
+
 	PWM1H_ON2;
 	PWM1L_ON2;
 	PWM2H_ON2;
@@ -1689,32 +2188,37 @@ void VoltageP1_Init(void){
 }
 
 //通道2电压环初始化
+/*
+ * 函数功能：按B路运行模式初始化本通道速度PI及输出范围
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void VoltageP2_Init(void){
 	
 	if(App.Logic.CtlMode == 3){		//往复运动的PID参数
-	mcApp_VoltageP_PIParam.qKp  = (float)MCPara2[46]/ 1000.0f;
-	mcApp_VoltageP_PIParam.qKi  = (float)MCPara2[47]/ 1000.0f;
-	mcApp_VoltageP_PIParam.qKc	= (float)MCPara2[48]/ 1000.0f;			
+	mcApp_VoltageP_PIParam2.qKp  = (float)MCPara2[46]/ 1000.0f; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
+	mcApp_VoltageP_PIParam2.qKi  = (float)MCPara2[47]/ 1000.0f; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
+	mcApp_VoltageP_PIParam2.qKc	= (float)MCPara2[48]/ 1000.0f; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
 	}else{
 		if(App.Logic.LogicHall_or_pll == 2){	//有Hall单向运动
-			mcApp_VoltageP_PIParam2.qKp  = (float)MCPara2[31]/ 1000.0f;
-			mcApp_VoltageP_PIParam2.qKi  = (float)MCPara2[32]/ 1000.0f;
-			mcApp_VoltageP_PIParam2.qKc	=  (float)MCPara2[33]/ 1000.0f;		
+			mcApp_VoltageP_PIParam2.qKp  = (float)MCPara2[31]/ 1000.0f; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
+			mcApp_VoltageP_PIParam2.qKi  = (float)MCPara2[32]/ 1000.0f; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
+			mcApp_VoltageP_PIParam2.qKc	=  (float)MCPara2[33]/ 1000.0f; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
 		}else{
-			mcApp_VoltageP_PIParam2.qKp  = (float)MCPara2[61]/ 1000.0f;
-			mcApp_VoltageP_PIParam2.qKi  = (float)MCPara2[62]/ 1000.0f;
-			mcApp_VoltageP_PIParam2.qKc	=  (float)MCPara2[63]/ 1000.0f;		
+			mcApp_VoltageP_PIParam2.qKp  = (float)MCPara2[61]/ 1000.0f; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
+			mcApp_VoltageP_PIParam2.qKi  = (float)MCPara2[62]/ 1000.0f; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
+			mcApp_VoltageP_PIParam2.qKc	=  (float)MCPara2[63]/ 1000.0f; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
 		}
 	}
 
-	mcApp_VoltageP_PIParam2.qOutMax = (float)MCPara2[34];
-	mcApp_VoltageP_PIParam2.qOutMin = (float)MCPara2[35];
+	mcApp_VoltageP_PIParam2.qOutMax = (float)MCPara2[34]; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
+	mcApp_VoltageP_PIParam2.qOutMin = (float)MCPara2[35]; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
 	mcApp_VoltageP_PIParam2.qdSumMax = (float)MCPara2[34];
 	mcApp_VoltageP_PIParam2.qdSumMin = -mcApp_VoltageP_PIParam2.qdSumMax;
 	
 	if(App.Logic.LogicHall_or_pll == 1){
-		mcApp_VoltageP_PIParam.qOutMin = (float)MCPara2[27];
-		mcApp_VoltageP_PIParam.qOutMax = (float)MCPara2[28];
+		mcApp_VoltageP_PIParam2.qOutMin = (float)MCPara2[27]; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
+		mcApp_VoltageP_PIParam2.qOutMax = (float)MCPara2[28]; /* B路参数只写B路PI，避免切换通道时污染另一通道。 */
 	}
 		
 	

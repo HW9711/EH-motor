@@ -24,7 +24,21 @@ uint8_t hallxuhuan[8] = {
 };
 
 //控制状态检测，切换霍尔，切换电机
+/*
+ * 函数功能：仅消费当前通道且已完成实际制动的状态，保持正常模式切换等待
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void Control_State_Scan(void){
+    if ((App.Logic.Brake_StopPwmOK != 0U) &&
+        (((App.Logic.Motor_Kind == 1U) && (App.FB.Status != HS_STOP) &&
+          !(((App.Logic.Brake_Kind == 2U) || (App.Logic.Brake_Kind == 4U)) && (App.FB.Status == HS_WAIT) && (App.FB.AllRun == 0U))) ||
+         ((App.Logic.Motor_Kind == 2U) && (App.FB2.Status != HS_STOP) &&
+          !(((App.Logic.Brake_Kind == 2U) || (App.Logic.Brake_Kind == 4U)) && (App.FB2.Status == HS_WAIT) && (App.FB2.AllRun == 0U)))))
+    {
+        App.Logic.Brake_StopPwmOK = 0U; /* 外部停止只接受本次STOP结果；换型和换Hall允许已关桥的WAIT继续等原延时，运行态旧结果一律丢弃。 */
+    }
+
 	if(App.Logic.Brake_Kind == 2){	//2:切换电机种类刹车
 		if( App.Logic.Motor_Kind_Change_Tim >= MCPara[42]){
 				App.Logic.Brake_StopTimOK = 1;				//时间ok
@@ -37,7 +51,7 @@ void Control_State_Scan(void){
 					App.Logic.Motor_Hall_Change_Tim =0;		//清		
 		}
 	}
-	if((App.Logic.Brake_Sign ==1 )&&(App.Logic.Brake_StopTimOK == 1)&&(App.Logic.Brake_StopPwmOK ==1)){		//1:停机刹车
+	if((App.Logic.Brake_Sign ==1 )&&(App.Logic.Brake_StopTimOK == 1)&&(App.Logic.Brake_StopPwmOK ==1)&&((App.Logic.Brake_Kind == 2)||(App.Logic.Brake_Kind == 4)) /* 换型和换Hall的等待完成不能代替外部停止。 */){		//1:停机刹车
 		//刹车完成
 		App.Logic.Brake_Sign = 0;
 		App.Logic.Brake_Kind = 0;
@@ -47,7 +61,7 @@ void Control_State_Scan(void){
 		App.Logic.Motor_Kind = App.Logic.Change_Kind;
 		App.Logic.LogicHall_or_pll = App.Logic.Change_Hall;
 		App.Logic.CtlMode = App.Logic.Change_Mode;
-	}else if((App.Logic.Brake_Sign == 1)&&(App.Logic.Brake_StopPwmOK ==1)&&(App.Logic.Brake_Kind ==1)){		//1:停机刹车
+	}else if((App.Logic.Brake_Sign == 1)&&(App.Logic.Brake_StopPwmOK ==1)&&(App.Logic.Brake_Kind ==1)&&(App.Logic.VBusNowPWM == 0)&&(TMR2->CC4 == 0U)) /* 零输出确认后才清停止模式，不能让旧标记跳过PWM递减。 */{		//1:停机刹车
 		//刹车完成
 		App.Logic.Brake_Sign = 0;
 		App.Logic.Brake_Kind = 0;
@@ -103,8 +117,31 @@ void Control_State_Scan(void){
 
 
 //方波逻辑--主要控制模式：正转、反转、往复运动 、位置控制（单步、回位）
+/*
+ * 函数功能：规划无刷A路正反转、往复和定位，外部停止优先且定位等待不阻塞控制节拍
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void Logic_Fangbo(void){
 	int8_t i = 0 ;
+    static uint32_t position_wait_ticks = 0U; /* 用500us节拍保存原定位步进等待，不能阻塞停机监督中断。 */
+    if ((App.FB.Status != HS_POSBRA) && ((App.Logic.CtlMode < 4U) || (App.Logic.CtlMode > 5U)))
+    {
+        position_wait_ticks = 0U; /* 退出定位后清除旧等待，避免下一次启动继承。 */
+    }
+    if ((position_wait_ticks != 0U) && (App.FB.Err == E_NONE) &&
+        ((App.FB.Status == HS_POSBRA) || (MotorCommand_IsStopRequested() == 0U)))
+    {
+        --position_wait_ticks; /* 仅延迟下一步定位，500us全局停机计时仍正常推进。 */
+        return; /* 保持当前定位输出直到原步间隔到期。 */
+    }
+
+	if (MotorCommand_IsStopRequested() != 0U)
+	{
+		App.FB.Start = 0U; /* 外部停止期间冻结普通模式和独立定位，往复不能把停止原因改回内部换向。 */
+	}
+	else
+	{
 	if(App.FB.Status != HS_BRA){
 		App.FB.Spd_Set = App.Logic.Set_Spd ;
 		App.FB.Rad_Set = App.FB.Spd_Set *(2.0f *M_PI)/60.0f;
@@ -231,7 +268,7 @@ void Logic_Fangbo(void){
 				App.Pos.PosHalli = App.Pos.PosNow1;		//之前锁定的位置
 			}
 			Hall_PhaseChange(RAMP_TABLE_Hall[App.Pos.PosHalli],7000);		//90%,定位到目前获取到的Hall的中间位置
-			Delay_ms(MCPara[54]);
+			position_wait_ticks = (uint32_t)MCPara[54] * 2U; /* 保留原毫秒间隔，改由后续500us节拍等待。 */
 			if((App.Pos.PosHallVal !=0)||(App.Pos.PosHallVal !=7)){			//判定霍尔的值不为0和7
 				App.Pos.LockPosStatus = 2;				//跳转第二步
 			}else {
@@ -257,7 +294,7 @@ void Logic_Fangbo(void){
 				
 				Hall_PhaseChange(App.Pos.PosHallVal,7000);		//90%			定位到期望的位置
 				
-				Delay_ms(MCPara[54]);
+				position_wait_ticks = (uint32_t)MCPara[54] * 2U; /* 保留原毫秒间隔，改由后续500us节拍等待。 */
 				App.Pos.PlanSteps -- ;
 			}else if(( App.Pos.PlanSteps > 0)&&(App.Pos.DragFlash ==0)){
 				//间隔
@@ -284,7 +321,17 @@ void Logic_Fangbo(void){
 		}
 	}
 	
-	if(App.FB.Status == HS_POSBRA){		//如果在位置刹车
+	}
+
+	if(App.FB.Status == HS_POSBRA){
+        if (App.FB.Err != E_NONE)
+        {
+            PWM_3l_Stop(); /* 定位故障优先关闭桥臂，不能继续执行旧步数。 */
+            TMR_SetCompare4(TMR2, 0U); /* 同步撤销定位BUCK输出。 */
+            App.FB.Status = HS_ERR; /* 保留故障状态供统一停机出口清理。 */
+            return; /* 错误周期不得再写定位PWM。 */
+        }
+		//如果在位置刹车
 		App.FB.Prot.HallDragCnt++;
 		if(App.FB.Prot.HallDragCnt > MCPara[66]){
 			App.FB.Prot.HallDragCnt = 0;
@@ -294,6 +341,7 @@ void Logic_Fangbo(void){
 			TMR_SetCompare4(TMR2, 0);	
 			//最后强定位时间
 			App.FB.Status = HS_WAIT;
+            return; /* 超过定位步数上限后立即退出，不能在同次调度再次换相。 */
 		}
 		
 		if(App.Logic.CtlMode == 0 ||App.Logic.CtlMode == 1||App.Logic.CtlMode == 2||App.Logic.CtlMode == 3){
@@ -304,7 +352,7 @@ void Logic_Fangbo(void){
 				}
 				App.Pos.PlanPosStep1 --;
 				Hall_PhaseChange(RAMP_TABLE_Hall[App.Pos.Tempi1],7000);		//90%,定位到目前获取到的Hall的中间位置
-				Delay_ms(MCPara[51]);					//步进间隔的时间
+				position_wait_ticks = (uint32_t)MCPara[51] * 2U; /* 保留原毫秒间隔，改由后续500us节拍等待。 */					//步进间隔的时间
 			}
 			else if(App.Pos.PlanPosStep1 < 0){		//如果现在的位置是负一圈，那么就正方向拉回来
 			if(App.Pos.PlanPosStep1 < 0){	
@@ -314,7 +362,7 @@ void Logic_Fangbo(void){
 				}
 				App.Pos.PlanPosStep1 ++;
 				Hall_PhaseChange(RAMP_TABLE_Hall[App.Pos.Tempi1],7000);		//90%,定位到目前获取到的Hall的中间位置
-				Delay_ms(MCPara[51]);				//步进间隔时间
+				position_wait_ticks = (uint32_t)MCPara[51] * 2U; /* 保留原毫秒间隔，改由后续500us节拍等待。 */				//步进间隔时间
 				}
 			}
 			else{
@@ -339,8 +387,31 @@ void Logic_Fangbo(void){
 
 
 //方波通道2逻辑控制
+/*
+ * 函数功能：规划无刷B路正反转、往复和定位，外部停止优先且定位等待不阻塞控制节拍
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void Logic_Fangbo2(void){
 	int8_t i = 0 ;
+    static uint32_t position_wait_ticks = 0U; /* 用500us节拍保存原定位步进等待，不能阻塞停机监督中断。 */
+    if ((App.FB2.Status != HS_POSBRA) && ((App.Logic.CtlMode < 4U) || (App.Logic.CtlMode > 5U)))
+    {
+        position_wait_ticks = 0U; /* 退出定位后清除旧等待，避免下一次启动继承。 */
+    }
+    if ((position_wait_ticks != 0U) && (App.FB2.Err == E_NONE) &&
+        ((App.FB2.Status == HS_POSBRA) || (MotorCommand_IsStopRequested() == 0U)))
+    {
+        --position_wait_ticks; /* 仅延迟下一步定位，500us全局停机计时仍正常推进。 */
+        return; /* 保持当前定位输出直到原步间隔到期。 */
+    }
+
+	if (MotorCommand_IsStopRequested() != 0U)
+	{
+		App.FB2.Start = 0U; /* 外部停止期间冻结普通模式和独立定位，往复不能把停止原因改回内部换向。 */
+	}
+	else
+	{
 	if(App.FB2.Status != HS_BRA){					
 		App.FB2.Spd_Set = App.Logic.Set_Spd ;//给定转速
 		App.FB2.Rad_Set = App.FB2.Spd_Set *(2.0f *M_PI)/60.0f;	//转化为角速度
@@ -469,7 +540,7 @@ void Logic_Fangbo2(void){
 				App.Pos.PosHalli = App.Pos.PosNow2;		//之前锁定的位置
 			}
 			Hall_PhaseChange2(RAMP_TABLE_Hall[App.Pos.PosHalli],7000);		//90%,定位到目前获取到的Hall的中间位置
-			Delay_ms(MCPara2[54]);
+			position_wait_ticks = (uint32_t)MCPara2[54] * 2U; /* 保留原毫秒间隔，改由后续500us节拍等待。 */
 			if((App.Pos.PosHallVal !=0)||(App.Pos.PosHallVal !=7)){			//判定霍尔的值不为0和7
 				App.Pos.LockPosStatus = 2;						//跳转第二步
 			}else {
@@ -494,7 +565,7 @@ void Logic_Fangbo2(void){
 				App.Pos.PosHallVal = RAMP_TABLE_Hall[App.Pos.PosHalli];
 				Hall_PhaseChange2(App.Pos.PosHallVal,7000);		//90%			定位到期望的位置
 				
-				Delay_ms(MCPara2[54]);
+				position_wait_ticks = (uint32_t)MCPara2[54] * 2U; /* 保留原毫秒间隔，改由后续500us节拍等待。 */
 				App.Pos.PlanSteps -- ;
 			}else if(( App.Pos.PlanSteps > 0)&&(App.Pos.DragFlash ==0)){
 				//间隔
@@ -522,7 +593,17 @@ void Logic_Fangbo2(void){
 		}
 	}	
 	
-	if(App.FB2.Status == HS_POSBRA){		//如果在位置刹车
+	}
+
+	if(App.FB2.Status == HS_POSBRA){
+        if (App.FB2.Err != E_NONE)
+        {
+            PWM_3l_Stop2(); /* 定位故障优先关闭桥臂，不能继续执行旧步数。 */
+            TMR_SetCompare4(TMR2, 0U); /* 同步撤销定位BUCK输出。 */
+            App.FB2.Status = HS_ERR; /* 保留故障状态供统一停机出口清理。 */
+            return; /* 错误周期不得再写定位PWM。 */
+        }
+		//如果在位置刹车
 		if(App.Logic.CtlMode == 0 ||App.Logic.CtlMode == 1||App.Logic.CtlMode == 2||App.Logic.CtlMode == 3){
 			
 			App.FB2.Prot.HallDragCnt++;
@@ -533,6 +614,7 @@ void Logic_Fangbo2(void){
 					//不需要定位或者定位结束
 				TMR_SetCompare4(TMR2, 0);	
 				App.FB2.Status = HS_WAIT;
+            return; /* 超过定位步数上限后立即退出，不能在同次调度再次换相。 */
 			}
 
 			if(App.Pos.PlanPosStep2 > 0){
@@ -542,7 +624,7 @@ void Logic_Fangbo2(void){
 				}
 				App.Pos.PlanPosStep2 --;
 				Hall_PhaseChange2(RAMP_TABLE_Hall[App.Pos.Tempi2],7000);		//90%,定位到目前获取到的Hall的中间位置
-				Delay_ms(MCPara2[51]);	
+				position_wait_ticks = (uint32_t)MCPara2[51] * 2U; /* 保留原毫秒间隔，改由后续500us节拍等待。 */
 			}
 			else if(App.Pos.PlanPosStep2 < 0){
 			if(App.Pos.PlanPosStep2 < 0){
@@ -552,7 +634,7 @@ void Logic_Fangbo2(void){
 				}
 				App.Pos.PlanPosStep2 ++;
 				Hall_PhaseChange2(RAMP_TABLE_Hall[App.Pos.Tempi2],7000);		//90%,定位到目前获取到的Hall的中间位置
-				Delay_ms(MCPara2[51]);	
+				position_wait_ticks = (uint32_t)MCPara2[51] * 2U; /* 保留原毫秒间隔，改由后续500us节拍等待。 */
 				}
 			}
 			else{

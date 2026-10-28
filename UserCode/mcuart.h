@@ -43,4 +43,13 @@ void YSCustomize_Return(USART_Type* USARTx,MCUART_Type* seruart);
  */
 void MotorCommand_ForceCommunicationStop(void);
 
+/* 函数功能：查询外部停止约束；输入参数：无；返回参数：非零禁止重新启动和普通调速。 */
+uint8_t MotorCommand_IsStopRequested(void);
+/* 函数功能：查询全部输出锁定；输入参数：无；返回参数：非零时换相和开桥入口也必须关闭。 */
+uint8_t MotorCommand_IsOutputLocked(void);
+/* 函数功能：监督外部停机期限；输入参数：无；返回参数：非零时定时任务跳过正常控制。 */
+uint8_t MotorCommand_ServiceStop500us(void);
+/* 函数功能：检查停机相关参数；输入参数：协议电机类型1~4；返回参数：参数有效为1。 */
+uint8_t MotorCommand_AreStopParametersValid(uint8_t motor_kind);
+
 #endif 

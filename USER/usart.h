@@ -20,7 +20,8 @@
 			unsigned int  ReAddrH;
 			unsigned char Re3num;   //需要返回的数量
 			
-		uint8_t    R_DATA[MAX_RXBUF];   
+		uint8_t    R_DATA[MAX_RXBUF]; /* 完整接收帧，只由空闲中断发布，主循环复制后解析。 */
+		uint8_t    DMA_R_DATA[MAX_RXBUF]; /* DMA专用接收区，下一帧不得覆盖正在校验的完整帧。 */
 		uint8_t    T_DATA[MAX_RXBUF];
 		uint8_t    MT_DATA[MAX_RXBUF];
 			uint8_t    RxEnd;

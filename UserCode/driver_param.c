@@ -7,6 +7,7 @@
 #include "YSprotect.h"
 #include "YSstatemachine.h"
 #include "youshua.h"
+#include "mcuart.h" /* 参数维护也要检查独立停机事务及可终止的制动参数。 */
 
 #include <string.h>
 
@@ -88,7 +89,10 @@ static uint8_t DriverParam_GetBank(uint8_t bank, DriverParamBank_t *result)
  */
 static uint8_t DriverParam_IsStopped(void)
 {
-    if ((App.FB.AllRun != 0U) || (App.FB2.AllRun != 0U))
+    if ((App.FB.AllRun != 0U) || (App.FB2.AllRun != 0U) ||
+        (App.FB.Status != HS_WAIT) || (App.FB2.Status != HS_WAIT) ||
+        (MotorCommand_IsStopRequested() != 0U) || (App.Logic.Set_Spd != 0U) ||
+        (App2.Log.u32SetSpd != 0U)) /* 启动、定位、待执行RUN及未完成停止均不允许维护。 */
     {
         return 0U; /* 任一路无刷仍在运行时禁止写参数和擦写Flash。 */
     }
@@ -177,7 +181,7 @@ static void DriverParam_SendWriteOk(USART_Type *USARTx, MCUART_Type *seruart)
 }
 
 /*
- * 函数功能：从独立Flash页装载两路有刷参数，保持无刷原有装载路径不变。
+ * 函数功能：装载两路有刷参数，并在RAM中将保存的旧K=2.8或1.8迁为新默认1.5；不擦写Flash，无刷装载路径不变。
  * 输入参数：无。
  * 返回参数：无。
  */
@@ -185,6 +189,26 @@ void DriverParam_Init(void)
 {
     F4Flash_SMCPara_Read(TEST_FLASH_ADDRESS_START_YS1, YSPara1, ParaNum, SYSPara1); /* 页103有效则读Flash，否则复制通道1编译默认。 */
     F4Flash_SMCPara_Read(TEST_FLASH_ADDRESS_START_YS2, YSPara2, ParaNum, SYSPara2); /* 页104有效则读Flash，否则复制通道2编译默认。 */
+
+    if ((YSPara1[18] == 280U) || (YSPara1[18] == 180U)) /* 只识别通道1刀头1保存的旧K=2.8或1.8，保留其他已调试系数。 */
+    {
+        YSPara1[18] = SYSPara1[18]; /* 在RAM中采用新默认K=1.5，不自动擦写Flash或修改其它参数。 */
+    }
+
+    if ((YSPara1[30] == 280U) || (YSPara1[30] == 180U)) /* 只识别通道1刀头2保存的旧K=2.8或1.8，保留其他已调试系数。 */
+    {
+        YSPara1[30] = SYSPara1[30]; /* 在RAM中采用新默认K=1.5，不自动擦写Flash或修改其它参数。 */
+    }
+
+    if ((YSPara2[18] == 280U) || (YSPara2[18] == 180U)) /* 只识别通道2刀头1保存的旧K=2.8或1.8，保留其他已调试系数。 */
+    {
+        YSPara2[18] = SYSPara2[18]; /* 在RAM中采用新默认K=1.5，不自动擦写Flash或修改其它参数。 */
+    }
+
+    if ((YSPara2[30] == 280U) || (YSPara2[30] == 180U)) /* 只识别通道2刀头2保存的旧K=2.8或1.8，保留其他已调试系数。 */
+    {
+        YSPara2[30] = SYSPara2[30]; /* 在RAM中采用新默认K=1.5，不自动擦写Flash或修改其它参数。 */
+    }
 }
 
 /*
@@ -198,6 +222,7 @@ uint8_t DriverParam_TryHandle(USART_Type *USARTx, MCUART_Type *seruart)
     uint8_t bank; /* 保存请求Bank。 */
     uint8_t index; /* 保存读写起始索引。 */
     uint16_t value; /* 保存06写入原始值。 */
+    uint16_t old_value; /* 参数检查失败时恢复原值，不污染运行参数。 */
     uint8_t count; /* 保存03读取数量。 */
     uint8_t data_offset; /* 保存03响应数据偏移。 */
     uint8_t item; /* 逐项复制读取参数。 */
@@ -303,7 +328,14 @@ uint8_t DriverParam_TryHandle(USART_Type *USARTx, MCUART_Type *seruart)
         return 1U;
     }
 
-    bank_info.runtime_values[index] = value; /* 只修改明确选择的一个参数，不联动改变任何保护时间。 */
+    old_value = bank_info.runtime_values[index]; /* 留存本次唯一修改项，异常组合必须原样回退。 */
+    bank_info.runtime_values[index] = value; /* 仅在完全停止状态试写这一项。 */
+    if (MotorCommand_AreStopParametersValid((uint8_t)(bank - 0x10U + 1U)) == 0U)
+    {
+        bank_info.runtime_values[index] = old_value; /* 恢复本次写入，避免零步长或错误PWM范围生效。 */
+        DriverParam_SendError(USARTx, seruart, 0x86U, 0x02U); /* 明确返回参数错误，不能回显成功。 */
+        return 1U; /* 无效参数不重载缓存、不写Flash。 */
+    }
     DriverParam_Apply(&bank_info); /* 停机状态下立即重载保护和位置缓存。 */
     DriverParam_SendWriteOk(USARTx, seruart); /* 写RAM和重载完成后回显成功。 */
     return 1U;

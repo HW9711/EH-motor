@@ -126,7 +126,6 @@ targets:
         - ../Libraries/CMSIS/CM4/CoreSupport
         - ../Libraries/CMSIS/CM4/DeviceSupport
         - ../MotorCode
-        - ../USER
         - ../UserCode
         - ../YouShua
         - .cmsis/include

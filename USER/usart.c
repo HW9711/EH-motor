@@ -69,7 +69,7 @@ void USART_DMA_Confi(USART_Type* USARTx,DMA_Channel_Type* DMAy_Channelx,uint32_t
 	DMA_Reset(DMAy_Channelx);                                               		
 	DMA_DefaultInitParaConfig(&DMA_InitStructure);
 	DMA_InitStructure.DMA_PeripheralBaseAddr    = PeripheralBaseAddr;          	//指定Channelx的外设基地址  DMA_CPBAx  传输源或目标
-	DMA_InitStructure.DMA_MemoryBaseAddr        = (uint32_t)(MemoryBaseAddr);		//(uint32_t)&SerUart1.R_DATA;   //数据储存地址    DMA_CMBAx     写入这个地址
+	DMA_InitStructure.DMA_MemoryBaseAddr        = (uint32_t)(MemoryBaseAddr);		//(uint32_t)&SerUart1.DMA_R_DATA;   //数据储存地址    DMA_CMBAx     写入这个地址
 	DMA_InitStructure.DMA_Direction             = DMA_DIR_PERIPHERALSRC;        //从外设读
 	DMA_InitStructure.DMA_BufferSize            = MAX_RXBUF;                    //传输个数  对应DMA传输通道个数
 	DMA_InitStructure.DMA_PeripheralInc         = DMA_PERIPHERALINC_DISABLE;    //指定外设地址寄存器是否递增  由于都是从&ADC1->RDOR中读取，所以不需要递增
@@ -85,18 +85,32 @@ void USART_DMA_Confi(USART_Type* USARTx,DMA_Channel_Type* DMAy_Channelx,uint32_t
 }
 
 //接收中断配置
-void Uart_IRQHandler(USART_Type* USARTx,DMA_Channel_Type* DMAy_Channelx,MCUART_Type * seruart){
-	uint32_t Temp = 0;
-	Temp = USARTx->STS;//必须将这两个寄存器的数值读出来
-	Temp = USARTx->DT;//必须将这两个寄存器的数值读出来
-	Temp = DMA_GetCurrDataCounter(DMAy_Channelx);//获取剩余数量
-	seruart->RxLen = MAX_RXBUF - Temp; //长度
-	seruart->RxEnd = 1;//接收完成
-	//为下一次接收做准备
-	DMAy_Channelx->CHCTRL &= 0xFFFFFFFE;
-	DMAy_Channelx->TCNT = MAX_RXBUF;
-	DMAy_Channelx->CHCTRL |= 0x00000001;
-	
+/*
+ * 函数功能：UART空闲时把DMA帧复制到独立完成区，再启动下一次接收。
+ * 输入参数：USARTx为串口，DMAy_Channelx为接收DMA，seruart为该串口上下文。
+ * 返回参数：无。
+ */
+void Uart_IRQHandler(USART_Type* USARTx, DMA_Channel_Type* DMAy_Channelx, MCUART_Type *seruart)
+{
+    uint32_t temp; /* 暂存状态寄存器和DMA剩余长度。 */
+    uint16_t length; /* 本次完整帧长度，不使用仍在变化的DMA计数参与后续CRC。 */
+    uint16_t index; /* 最多复制70字节，接收区停止后再进行一致性复制。 */
+    temp = USARTx->STS; /* 先读状态寄存器，按外设要求清空闲中断。 */
+    temp = USARTx->DT; /* 再读数据寄存器，完成空闲标志清除序列。 */
+    DMAy_Channelx->CHCTRL &= 0xFFFFFFFEU; /* 冻结DMA写入，避免复制过程中下一帧改写数据。 */
+    temp = DMA_GetCurrDataCounter(DMAy_Channelx); /* 冻结后读取剩余数，长度与内容属于同一帧。 */
+    length = (temp <= MAX_RXBUF) ? (uint16_t)(MAX_RXBUF - temp) : 0U; /* 异常计数不能形成越界长度。 */
+    if (length != 0U)
+    {
+        for (index = 0U; index < length; ++index)
+        {
+            seruart->R_DATA[index] = seruart->DMA_R_DATA[index]; /* 发布独立完成帧，不让下一次DMA继续写本区。 */
+        }
+        seruart->RxLen = length; /* 内容复制完成后再发布对应长度。 */
+        seruart->RxEnd = 1U; /* 主循环只消费已经完整发布的接收帧。 */
+    }
+    DMAy_Channelx->TCNT = MAX_RXBUF; /* 为下一帧重新装载DMA计数。 */
+    DMAy_Channelx->CHCTRL |= 0x00000001U; /* 恢复DMA，后续字节只进入DMA_R_DATA。 */
 }
 
 
@@ -193,6 +207,11 @@ void Modbus_Send(USART_Type* USARTx, uint8_t *pData,uint16_t Len){
 
 
 
+/*
+ * 函数功能：初始化已启用串口，并把DMA接收地址指向独立实时接收区
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void UART_Init(void){
 	
 	#if _AllUart == 1
@@ -241,7 +260,7 @@ void UART_Init(void){
 			USART_Base_Confi(USART1,Uart1_Rate);
 			//中断
 			USART_NVIC_Confi(USART1,USART1_IRQn,Uart1_NVIC_Priority);
-			USART_DMA_Confi(USART1,Uart1_DMA_CH,Uart1_DMA_ADDR,&SerUart1.R_DATA[0],Uart1_DMA_Priority);
+			USART_DMA_Confi(USART1,Uart1_DMA_CH,Uart1_DMA_ADDR,&SerUart1.DMA_R_DATA[0],Uart1_DMA_Priority);
 			//使能串口
 			USART_Cmd(USART1, ENABLE);
 		#endif
@@ -302,7 +321,7 @@ void UART_Init(void){
 			USART_Base_Confi(USART3,Uart3_Rate);
 			//中断
 			USART_NVIC_Confi(USART3,USART3_IRQn,Uart3_NVIC_Priority);
-			USART_DMA_Confi(USART3,Uart3_DMA_CH,Uart3_DMA_ADDR,&SerUart3.R_DATA[0],Uart3_DMA_Priority);
+			USART_DMA_Confi(USART3,Uart3_DMA_CH,Uart3_DMA_ADDR,&SerUart3.DMA_R_DATA[0],Uart3_DMA_Priority);
 			//使能串口
 			USART_Cmd(USART3, ENABLE);
 		#endif
@@ -353,7 +372,7 @@ void UART_Init(void){
 			USART_Base_Confi(UART5,Uart5_Rate);
 			//中断
 			USART_NVIC_Confi(UART5,UART5_IRQn,Uart5_NVIC_Priority);
-			USART_DMA_Confi(UART5,Uart5_DMA_CH,Uart5_DMA_ADDR,&SerUart5.R_DATA[0],Uart5_DMA_Priority);
+			USART_DMA_Confi(UART5,Uart5_DMA_CH,Uart5_DMA_ADDR,&SerUart5.DMA_R_DATA[0],Uart5_DMA_Priority);
 			//使能串口
 			USART_Cmd(UART5, ENABLE);
 		#endif
@@ -402,7 +421,7 @@ void UART_Init(void){
 			USART_Base_Confi(USART6,Uart6_Rate);
 			//中断
 			USART_NVIC_Confi(USART6,USART6_IRQn,Uart6_NVIC_Priority);
-			USART_DMA_Confi(USART6,Uart6_DMA_CH,Uart6_DMA_ADDR,&SerUart6.R_DATA[0],Uart6_DMA_Priority);
+			USART_DMA_Confi(USART6,Uart6_DMA_CH,Uart6_DMA_ADDR,&SerUart6.DMA_R_DATA[0],Uart6_DMA_Priority);
 			//使能串口
 			USART_Cmd(USART6, ENABLE);
 		#endif

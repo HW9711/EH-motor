@@ -1,6 +1,7 @@
 #include "YSprotect.h"
 #include "youshua.h"
 #include "YSmcctl.h"
+#include "YSstatemachine.h" /* 本地保护触发后直接执行故障关断，避免等待主控零速。 */
 
 //有刷保护参数初始化
 void YSProtect_Init(void){
@@ -41,7 +42,7 @@ void YSProtect_Init(void){
 
 
 /*
- * 函数功能：执行有刷通道堵转和过流保护；通信租约由SystemProtect统一处理。
+ * 函数功能：执行有刷堵转和过流保护并立即关闭故障输出；判定阈值不变，通信租约仍由SystemProtect统一处理。
  * 输入参数：无。
  * 返回参数：无。
  */
@@ -159,6 +160,18 @@ if(App2.SysCtl.CheckCyc == 1 && App2.Err == E_NONE){
 			}							
 		}
 	}
+
+    if (App2.Err != E_NONE) /* 保留原保护判定与阈值，只补齐已产生故障的本地关断。 */
+    {
+        if (App2.Log.Channel == 3U) /* 故障只关闭当前有刷A路桥臂及共用BUCK。 */
+        {
+            Ctl_Error(); /* 同一次保护处理清掉硬件输出和历史估速，不再等待下一状态机周期。 */
+        }
+        else if (App2.Log.Channel == 4U) /* 有刷B路采用同样的故障关断次序。 */
+        {
+            Ctl_Error2(); /* 保留原错误码，后续仍由合法零速帧完成清错。 */
+        }
+    }
 }
 
 

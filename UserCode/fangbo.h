@@ -19,6 +19,8 @@ void PWM_3l_Start2(void);
 
 
 
+uint8_t HallOsc_CaptureEdge(uint8_t channel); /* 仅有霍尔往复使用完整计时捕获；返回0时继续原模式逻辑。 */
+uint8_t HallOsc_TimerOverflow(void); /* 仅有霍尔往复累计TMR5溢出，其他模式返回0。 */
 void HallSqu_ADCISRTasks(void);
 void Hall_Vbus_PI_Out(void);
 void Hall_Vbus_PI_Out2(void);

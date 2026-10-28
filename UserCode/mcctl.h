@@ -350,6 +350,8 @@ typedef enum
 	E_HandShake			,				//13通讯错误
 	E_PhaseLoss     ,    		//14缺相
 	E_PosDrag			,					//15有Hall拖动错误
+	E_StopTimeout = 16, /* 外部停止超时，全部输出锁定到驱动复位。 */
+	E_StopParam = 17, /* 停机参数无效，本次启动被拒绝，停机后可维护参数。 */
 	
 	
 }Error_TypeDef;

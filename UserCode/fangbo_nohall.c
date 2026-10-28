@@ -8,6 +8,7 @@
 #include "mcfoc.h"
 #include "mcflash.h"
 #include "adc.h"
+#include "mcuart.h" /* 启动闭环切换必须服从外部停止约束。 */
 
 // 5-1-3-2-6-4		CCW
  // 5-4-6-2-3-1		CW			
@@ -15,12 +16,19 @@
 //5BA-1CA-3CB-2AB-6AC-4BC
 
 //通道1无霍尔换向+启动拖动检测CW
+/*
+ * 函数功能：处理无霍尔A路CW换相，限于有效启动阶段发布闭环运行
+ * 输入参数：hall_val为当前检测相序。
+ * 返回参数：无。
+ */
 void OpenLoop_check_changeCW(uint8_t hall_val){
 //CW
 	volatile uint8_t val = 0;
-	if((App.FB.OpenLoop.StartHallOkCnt > 2000)&&(App.FB.OpenLoop.OpenLoopTime>MCPara[30])){
+	if((App.FB.Status == HS_START) && (App.FB.Start != 0U) && (App.Logic.Brake_Sign == 0U) &&
+       (MotorCommand_IsStopRequested() == 0U) &&
+       (App.FB.OpenLoop.StartHallOkCnt > 2000) && (App.FB.OpenLoop.OpenLoopTime > MCPara[30])) /* 只有本次有效启动可以切闭环，制动期间的旧检测结果不得恢复RUN。 */{
 		//切入闭环初始化
-		App.FB2.Rad_Now = 100;
+		App.FB.Rad_Now = 100; /* A路闭环初值只写A路，禁止改动B路估计状态。 */
 		mcApp_VoltageP_PIParam.qdSum = App.Logic.VBusNowPWM;
 		App.Logic.VBusSetPWM = App.Logic.VBusNowPWM;
 		App.FB.OpenLoop.StartHallOkFg = 1;	//检测成功
@@ -127,10 +135,17 @@ void OpenLoop_check_changeCW(uint8_t hall_val){
 
 
 //通道2无霍尔换向+启动拖动检测CW
+/*
+ * 函数功能：处理无霍尔B路CW换相，限于有效启动阶段发布闭环运行
+ * 输入参数：hall_val为当前检测相序。
+ * 返回参数：无。
+ */
 void OpenLoop_check_changeCW2(uint8_t hall_val){
 //CW
 	volatile uint8_t val = 0;
-	if((App.FB2.OpenLoop.StartHallOkCnt > 2000)&&(App.FB2.OpenLoop.OpenLoopTime>MCPara2[30])){
+	if((App.FB2.Status == HS_START) && (App.FB2.Start != 0U) && (App.Logic.Brake_Sign == 0U) &&
+       (MotorCommand_IsStopRequested() == 0U) &&
+       (App.FB2.OpenLoop.StartHallOkCnt > 2000) && (App.FB2.OpenLoop.OpenLoopTime > MCPara2[30])) /* 只有本次有效启动可以切闭环，制动期间的旧检测结果不得恢复RUN。 */{
 //if(App.FB.OpenLoop.StartHallOkCnt > 1000){		
 		//切入闭环初始化
 		App.FB2.Rad_Now = 100;
@@ -240,10 +255,17 @@ void OpenLoop_check_changeCW2(uint8_t hall_val){
 }
 
 //通道1无霍尔换向+启动拖动检测CCW
+/*
+ * 函数功能：处理无霍尔A路CCW换相，限于有效启动阶段发布闭环运行
+ * 输入参数：hall_val为当前检测相序。
+ * 返回参数：无。
+ */
 void OpenLoop_check_changeCCW(uint8_t hall_val){
 //CW
 	volatile uint8_t val = 0;
-	if((App.FB.OpenLoop.StartHallOkCnt > 2000)&&(App.FB.OpenLoop.OpenLoopTime>MCPara[30])){
+	if((App.FB.Status == HS_START) && (App.FB.Start != 0U) && (App.Logic.Brake_Sign == 0U) &&
+       (MotorCommand_IsStopRequested() == 0U) &&
+       (App.FB.OpenLoop.StartHallOkCnt > 2000) && (App.FB.OpenLoop.OpenLoopTime > MCPara[30])) /* 只有本次有效启动可以切闭环，制动期间的旧检测结果不得恢复RUN。 */{
 		//切入闭环初始化
 		App.FB.Rad_Now = -100;
 		mcApp_VoltageP_PIParam.qdSum = App.Logic.VBusNowPWM;
@@ -352,10 +374,17 @@ void OpenLoop_check_changeCCW(uint8_t hall_val){
 
 
 //通道2无霍尔换向+启动拖动检测CCW
+/*
+ * 函数功能：处理无霍尔B路CCW换相，限于有效启动阶段发布闭环运行
+ * 输入参数：hall_val为当前检测相序。
+ * 返回参数：无。
+ */
 void OpenLoop_check_changeCCW2(uint8_t hall_val){
 //CW
 	volatile uint8_t val = 0;
-	if((App.FB2.OpenLoop.StartHallOkCnt > 2000)&&(App.FB2.OpenLoop.OpenLoopTime>MCPara2[30])){//if(App.FB.OpenLoop.StartHallOkCnt > 1000){
+	if((App.FB2.Status == HS_START) && (App.FB2.Start != 0U) && (App.Logic.Brake_Sign == 0U) &&
+       (MotorCommand_IsStopRequested() == 0U) &&
+       (App.FB2.OpenLoop.StartHallOkCnt > 2000) && (App.FB2.OpenLoop.OpenLoopTime > MCPara2[30])) /* 只有本次有效启动可以切闭环，制动期间的旧检测结果不得恢复RUN。 */{//if(App.FB.OpenLoop.StartHallOkCnt > 1000){
 		//切入闭环初始化
 		App.FB2.Rad_Now = -100;
 		mcApp_VoltageP_PIParam2.qdSum = App.Logic.VBusNowPWM;

@@ -7,7 +7,20 @@
 
 
 //有刷逻辑控制
+/*
+ * 函数功能：规划有刷正反转和往复，外部停机期间只撤销启动许可
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void YSLog_Ctl(void){
+    if (MotorCommand_IsStopRequested() != 0U)
+    {
+        App2.Ch1.Start = 0U; /* 停止优先于A路往复方向调度。 */
+        App2.Ch2.Start = 0U; /* 同步撤销B路启动，不能因另一通道等待状态重新取得许可。 */
+        App2.SysCtl.SpdSet = 0.0f; /* 普通调速目标保持零，制动斜率继续使用原参数。 */
+        return; /* 停止完成前冻结往复相位及方向切换。 */
+    }
+
 	
 	if(App2.Log.OldChannel != App2.Log.Channel){				//如果通发生变化
 		App2.Log.OldChannel = App2.Log.Channel;

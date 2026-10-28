@@ -20,7 +20,16 @@ extern uint8_t NextCWhall[7];
 
 
 //500us中断函数
+/*
+ * 函数功能：执行500us控制调度，并先监督外部停机期限和故障关断
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void TIM_500us_Int(void){
+    if (MotorCommand_ServiceStop500us() != 0U) /* 停机故障独立于当前有刷/无刷模式处理。 */
+    {
+        return; /* 输出已实际全关，不能继续执行任何启动、往复或定位分支。 */
+    }
 
 	if(YSorWSFlag == 1 ){		//无刷计时
 		
@@ -205,125 +214,127 @@ void FangBo_1ms(void){
 }
 
 //无刷通道1——1ms控制
-void Ctl_1ms(void){	
-	HallSqu_Ctl();				//方波状态机	1ms一次
-	if(App.Logic.CtlMode == 1 || App.Logic.CtlMode == 2 || App.Logic.CtlMode == 3){			//模式1/2/3的PWM控制在这里
-		if(App.FB.Status == HS_BRA){		//在刹车状态，根据不同的刹车种类去进行不同力度的刹车
-			if(App.Logic.VBusNowPWM >0){	//通过BUCK去刹车更加平稳
-				switch (App.Logic.Brake_Kind){
-					case  0:
-						App.FB.Status = HS_STOP;
-						break;
-					case	1:
-						App.Logic.VBusNowPWM -=MCPara[44];	//停机指令刹车PWM衰减速度	
-						break;	
-					case  2:
-						App.Logic.VBusNowPWM -=MCPara[38];	//切换电机指令刹车PWM衰减速度	
-						break;
-					case	3:
-						App.Logic.VBusNowPWM -=MCPara[41];	//切换方向指令刹车PWM衰减速度
-						break;
-					case	4:
-						App.Logic.VBusNowPWM -=MCPara[39];	//切换Hall指令刹车PWM衰减速度
-						break;
-					case	5:
-						App.Logic.VBusNowPWM -=MCPara[40];	//有Hall模式3指令刹车PWM衰减速度
-						break;
-					default:
-						break;
-				}
-				
-			}
-			//限幅：以免超出PWM值范围
-			if(App.Logic.VBusNowPWM >mcApp_VoltageP_PIParam.qOutMax){
-				App.Logic.VBusNowPWM  = mcApp_VoltageP_PIParam.qOutMax ;
-			}else if(App.Logic.VBusNowPWM < mcApp_VoltageP_PIParam.qOutMin){
-				App.Logic.VBusNowPWM  = mcApp_VoltageP_PIParam.qOutMin ;
-			}
-//			PWMNow_text = App.Logic.VBusNowPWM;
-			//直接输出到BUCK
-			TMR_SetCompare4(TMR2, App.Logic.VBusNowPWM);
-			
-		}else{		//正常闭环
-			if(App.FB.AllRun == 1){
-				if(App.FB.Status == HS_RUN){
-					Hall_Vbus_PI_Out();		//有Hall的电压环计算
-				}else{					
-				}
-			}
-		}
-	}
-
+/*
+ * 函数功能：执行无刷A路状态机和母线控制，制动递减不受运行模式门禁阻断
+ * 输入参数：无。
+ * 返回参数：无。
+ */
+void Ctl_1ms(void)
+{
+    HallSqu_Ctl(); /* 先处理启动、运行、制动及错误状态。 */
+    if (App.FB.Status == HS_BRA) /* 停止模式也必须继续降低已有输出。 */
+    {
+        if (App.Logic.VBusNowPWM > 0)
+        {
+            switch (App.Logic.Brake_Kind)
+            {
+                case 0: App.FB.Status = HS_STOP; break; /* 无有效制动原因时退出本通道，不得改动另一路状态。 */
+                case 1: App.Logic.VBusNowPWM -= MCPara[44]; break; /* 外部停止沿用本通道原停止斜率。 */
+                case 2: App.Logic.VBusNowPWM -= MCPara[38]; break; /* 保留切换电机类型的制动力度。 */
+                case 3: App.Logic.VBusNowPWM -= MCPara[41]; break; /* 保留正反转切换的制动力度。 */
+                case 4: App.Logic.VBusNowPWM -= MCPara[39]; break; /* 保留反馈类型切换的制动力度。 */
+                case 5: App.Logic.VBusNowPWM -= MCPara[40]; break; /* 往复内部换向继续使用原快速制动参数。 */
+                default: break; /* 未定义原因由外部停机期限兜底关断。 */
+            }
+        }
+        if (App.Logic.VBusNowPWM > mcApp_VoltageP_PIParam.qOutMax)
+        {
+            App.Logic.VBusNowPWM = mcApp_VoltageP_PIParam.qOutMax; /* 正常上限仍按本通道原PI配置。 */
+        }
+        if (App.Logic.Brake_Kind == 1U)
+        {
+            if (App.Logic.VBusNowPWM < 0)
+            {
+                App.Logic.VBusNowPWM = 0; /* 外部停止必须允许降到零，不能卡在运行最小PWM。 */
+            }
+        }
+        else if (App.Logic.VBusNowPWM < mcApp_VoltageP_PIParam.qOutMin)
+        {
+            App.Logic.VBusNowPWM = mcApp_VoltageP_PIParam.qOutMin; /* 内部换向保留原最小输出和往复特性。 */
+        }
+        TMR_SetCompare4(TMR2, App.Logic.VBusNowPWM); /* 每次制动递减都落实到实际BUCK寄存器。 */
+    }
+    else if (((App.Logic.CtlMode == 1U) || (App.Logic.CtlMode == 2U) || (App.Logic.CtlMode == 3U)) &&
+             (App.FB.AllRun == 1U) && (App.FB.Status == HS_RUN) &&
+             (MotorCommand_IsStopRequested() == 0U))
+    {
+        Hall_Vbus_PI_Out(); /* 外部停止期间普通调速不能再次抬高母线输出。 */
+    }
 }
 
 
 //无刷通道2——1ms控制
-void Ctl_1ms2(void){
-	HallSqu_Ctl2();				//方波状态机	1ms一次
-	if(App.Logic.CtlMode == 1 || App.Logic.CtlMode == 2 || App.Logic.CtlMode == 3){			//模式1/2/3的PWM控制在这里
-		if(App.FB2.Status == HS_BRA){		//在刹车状态，根据不同的刹车种类去进行不同力度的刹车
-			if(App.Logic.VBusNowPWM >0){  //通过BUCK去刹车更加平稳
-				switch (App.Logic.Brake_Kind){
-					case  0:
-						App.FB.Status = HS_STOP;
-						break;
-					case	1:
-						App.Logic.VBusNowPWM -=MCPara2[44];  	//停机指令刹车PWM衰减速度	
-						break;	                             
-					case  2:                               
-						App.Logic.VBusNowPWM -=MCPara2[38];		//切换电机指令刹车PWM衰减速度	
-						break;                               
-					case	3:                               
-						App.Logic.VBusNowPWM -=MCPara2[41];  	//切换方向指令刹车PWM衰减速度
-						break;                               
-					case	4:                               
-						App.Logic.VBusNowPWM -=MCPara2[39];  	//切换Hall指令刹车PWM衰减速度
-						break;
-					case	5:
-						App.Logic.VBusNowPWM -=MCPara2[40];	//切换Hall指令刹车PWM衰减速度
-						break;				
-					default:
-						break;
-				}
-			}
-			//限幅：以免超出PWM值范围
-			if(App.Logic.VBusNowPWM >mcApp_VoltageP_PIParam2.qOutMax){
-				App.Logic.VBusNowPWM  = mcApp_VoltageP_PIParam2.qOutMax ;
-			}else if(App.Logic.VBusNowPWM < mcApp_VoltageP_PIParam2.qOutMin){
-				App.Logic.VBusNowPWM  = mcApp_VoltageP_PIParam2.qOutMin ;
-			}
-//			PWMNow_text = App.Logic.VBusNowPWM  ;
-			//直接输出到BUCK
-			TMR_SetCompare4(TMR2, App.Logic.VBusNowPWM);
-			
-		}else{		//正常闭环
-			if(App.FB2.AllRun == 1){
-				if(App.FB2.Status == HS_RUN ){
-					Hall_Vbus_PI_Out2();		//有Hall的电压环计算
-				}			
-			}else{
-			}
-		}	
-	}else if(App.Logic.CtlMode == 4||App.Logic.CtlMode == 5){									//模式4/5的PWM控制和步数控制在这里
-
-	}
+/*
+ * 函数功能：执行无刷B路状态机和母线控制，制动递减不受运行模式门禁阻断
+ * 输入参数：无。
+ * 返回参数：无。
+ */
+void Ctl_1ms2(void)
+{
+    HallSqu_Ctl2(); /* 先处理启动、运行、制动及错误状态。 */
+    if (App.FB2.Status == HS_BRA) /* 停止模式也必须继续降低已有输出。 */
+    {
+        if (App.Logic.VBusNowPWM > 0)
+        {
+            switch (App.Logic.Brake_Kind)
+            {
+                case 0: App.FB2.Status = HS_STOP; break; /* 无有效制动原因时退出本通道，不得改动另一路状态。 */
+                case 1: App.Logic.VBusNowPWM -= MCPara2[44]; break; /* 外部停止沿用本通道原停止斜率。 */
+                case 2: App.Logic.VBusNowPWM -= MCPara2[38]; break; /* 保留切换电机类型的制动力度。 */
+                case 3: App.Logic.VBusNowPWM -= MCPara2[41]; break; /* 保留正反转切换的制动力度。 */
+                case 4: App.Logic.VBusNowPWM -= MCPara2[39]; break; /* 保留反馈类型切换的制动力度。 */
+                case 5: App.Logic.VBusNowPWM -= MCPara2[40]; break; /* 往复内部换向继续使用原快速制动参数。 */
+                default: break; /* 未定义原因由外部停机期限兜底关断。 */
+            }
+        }
+        if (App.Logic.VBusNowPWM > mcApp_VoltageP_PIParam2.qOutMax)
+        {
+            App.Logic.VBusNowPWM = mcApp_VoltageP_PIParam2.qOutMax; /* 正常上限仍按本通道原PI配置。 */
+        }
+        if (App.Logic.Brake_Kind == 1U)
+        {
+            if (App.Logic.VBusNowPWM < 0)
+            {
+                App.Logic.VBusNowPWM = 0; /* 外部停止必须允许降到零，不能卡在运行最小PWM。 */
+            }
+        }
+        else if (App.Logic.VBusNowPWM < mcApp_VoltageP_PIParam2.qOutMin)
+        {
+            App.Logic.VBusNowPWM = mcApp_VoltageP_PIParam2.qOutMin; /* 内部换向保留原最小输出和往复特性。 */
+        }
+        TMR_SetCompare4(TMR2, App.Logic.VBusNowPWM); /* 每次制动递减都落实到实际BUCK寄存器。 */
+    }
+    else if (((App.Logic.CtlMode == 1U) || (App.Logic.CtlMode == 2U) || (App.Logic.CtlMode == 3U)) &&
+             (App.FB2.AllRun == 1U) && (App.FB2.Status == HS_RUN) &&
+             (MotorCommand_IsStopRequested() == 0U))
+    {
+        Hall_Vbus_PI_Out2(); /* 外部停止期间普通调速不能再次抬高母线输出。 */
+    }
 }
 
 
+/*
+ * 函数功能：捕获B路霍尔边沿，往复补偿计时回卷，其余模式保留原计数。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void EXTI2_IRQHandler(void){
 	if(EXTI_GetIntStatus(EXTI_Line2) != RESET){
-		App.FB2.Cyc_Hall ++;		//周期
-		App.FB2.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
-		TMR5->CNT = 0;
+		if (HallOsc_CaptureEdge(2U) == 0U) /* 往复使用完整计时，其他模式原样执行旧测速。 */
+		{
+			App.FB2.Cyc_Hall ++;		//周期
+			App.FB2.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
+			TMR5->CNT = 0;
 
-		if(App.FB2.Cyc_Hall >=6){
-					App.FB2.Hall_Timer_Sum =App.FB2.Hall_Timer_Cnt +App.FB2.Hall_Timer_Sum;
-					App.FB2.Hall_Timer_Sum_Now = App.FB2.Hall_Timer_Sum ;		//周期满传递值
-					App.FB2.Hall_Timer_Sum = 0;
-					App.FB2.Cyc_Hall = 0;
-			}else{
-			App.FB2.Hall_Timer_Sum =App.FB2.Hall_Timer_Cnt +App.FB2.Hall_Timer_Sum;
-			}
+			if(App.FB2.Cyc_Hall >=6){
+						App.FB2.Hall_Timer_Sum =App.FB2.Hall_Timer_Cnt +App.FB2.Hall_Timer_Sum;
+						App.FB2.Hall_Timer_Sum_Now = App.FB2.Hall_Timer_Sum ;		//周期满传递值
+						App.FB2.Hall_Timer_Sum = 0;
+						App.FB2.Cyc_Hall = 0;
+				}else{
+				App.FB2.Hall_Timer_Sum =App.FB2.Hall_Timer_Cnt +App.FB2.Hall_Timer_Sum;
+				}
+		}
 		EXTI_ClearIntPendingBit(EXTI_Line2);  //清除中断标志
 		}
 }
@@ -340,48 +351,62 @@ void EXTI9_5_IRQHandler(void){
 
 
 //中断
+/*
+ * 函数功能：分发A/B路霍尔边沿，往复只接受活动通道的完整有效间隔。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void EXTI15_10_IRQHandler(void){
 
 		if(EXTI_GetIntStatus(EXTI_Line10) != RESET){
-			App.FB.Cyc_Hall ++;		//周期
-			App.FB.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
-				TMR_SetCounter(TMR5,0);
-				if(App.FB.Cyc_Hall >=6){
+			if (HallOsc_CaptureEdge(1U) == 0U) /* 往复使用完整计时，其他模式原样执行旧测速。 */
+			{
+				App.FB.Cyc_Hall ++;		//周期
+				App.FB.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
+					TMR_SetCounter(TMR5,0);
+					if(App.FB.Cyc_Hall >=6){
+						App.FB.Hall_Timer_Sum =App.FB.Hall_Timer_Cnt +App.FB.Hall_Timer_Sum;
+						App.FB.Hall_Timer_Sum_Now = App.FB.Hall_Timer_Sum ;
+						App.FB.Hall_Timer_Sum = 0;
+						App.FB.Cyc_Hall = 0;
+					}else{
 					App.FB.Hall_Timer_Sum =App.FB.Hall_Timer_Cnt +App.FB.Hall_Timer_Sum;
-					App.FB.Hall_Timer_Sum_Now = App.FB.Hall_Timer_Sum ;
-					App.FB.Hall_Timer_Sum = 0;
-					App.FB.Cyc_Hall = 0;
-				}else{
-				App.FB.Hall_Timer_Sum =App.FB.Hall_Timer_Cnt +App.FB.Hall_Timer_Sum;
-				}
+					}
+			}
 			
 			EXTI_ClearIntPendingBit(EXTI_Line10);  ///<Clear the  EXTI line 0 pending bit
 		}
 		if(EXTI_GetIntStatus(EXTI_Line11) != RESET){
 			if(App.Logic.Motor_Kind == 1){
-				App.FB.Cyc_Hall ++;
-				App.FB.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
-				TMR_SetCounter(TMR5,0);
-				if(App.FB.Cyc_Hall >=6){
+				if (HallOsc_CaptureEdge(1U) == 0U) /* 往复使用完整计时，其他模式原样执行旧测速。 */
+				{
+					App.FB.Cyc_Hall ++;
+					App.FB.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
+					TMR_SetCounter(TMR5,0);
+					if(App.FB.Cyc_Hall >=6){
+						App.FB.Hall_Timer_Sum =App.FB.Hall_Timer_Cnt +App.FB.Hall_Timer_Sum;
+						App.FB.Hall_Timer_Sum_Now = App.FB.Hall_Timer_Sum ;
+						App.FB.Hall_Timer_Sum = 0;
+						App.FB.Cyc_Hall = 0;
+					}else{
 					App.FB.Hall_Timer_Sum =App.FB.Hall_Timer_Cnt +App.FB.Hall_Timer_Sum;
-					App.FB.Hall_Timer_Sum_Now = App.FB.Hall_Timer_Sum ;
-					App.FB.Hall_Timer_Sum = 0;
-					App.FB.Cyc_Hall = 0;
-				}else{
-				App.FB.Hall_Timer_Sum =App.FB.Hall_Timer_Cnt +App.FB.Hall_Timer_Sum;
+					}
 				}
 			}else if(App.Logic.Motor_Kind == 2){
-				App.FB2.Cyc_Hall ++;		//周期
-				App.FB2.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
-				TMR_SetCounter(TMR5,0);
+				if (HallOsc_CaptureEdge(2U) == 0U) /* 往复使用完整计时，其他模式原样执行旧测速。 */
+				{
+					App.FB2.Cyc_Hall ++;		//周期
+					App.FB2.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
+					TMR_SetCounter(TMR5,0);
 
-				if(App.FB2.Cyc_Hall >=6){
+					if(App.FB2.Cyc_Hall >=6){
+						App.FB2.Hall_Timer_Sum =App.FB2.Hall_Timer_Cnt +App.FB2.Hall_Timer_Sum;
+						App.FB2.Hall_Timer_Sum_Now = App.FB2.Hall_Timer_Sum ;		//周期满传递值
+						App.FB2.Hall_Timer_Sum = 0;
+						App.FB2.Cyc_Hall = 0;
+					}else{
 					App.FB2.Hall_Timer_Sum =App.FB2.Hall_Timer_Cnt +App.FB2.Hall_Timer_Sum;
-					App.FB2.Hall_Timer_Sum_Now = App.FB2.Hall_Timer_Sum ;		//周期满传递值
-					App.FB2.Hall_Timer_Sum = 0;
-					App.FB2.Cyc_Hall = 0;
-				}else{
-				App.FB2.Hall_Timer_Sum =App.FB2.Hall_Timer_Cnt +App.FB2.Hall_Timer_Sum;
+					}
 				}
 				
 			}
@@ -389,29 +414,35 @@ void EXTI15_10_IRQHandler(void){
 		}
 		if(EXTI_GetIntStatus(EXTI_Line12) != RESET){
 			if(App.Logic.Motor_Kind == 1){
-				App.FB.Cyc_Hall ++;
-				App.FB.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
-				TMR_SetCounter(TMR5,0);
-				if(App.FB.Cyc_Hall >=6){
+				if (HallOsc_CaptureEdge(1U) == 0U) /* 往复使用完整计时，其他模式原样执行旧测速。 */
+				{
+					App.FB.Cyc_Hall ++;
+					App.FB.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
+					TMR_SetCounter(TMR5,0);
+					if(App.FB.Cyc_Hall >=6){
+						App.FB.Hall_Timer_Sum =App.FB.Hall_Timer_Cnt +App.FB.Hall_Timer_Sum;
+						App.FB.Hall_Timer_Sum_Now = App.FB.Hall_Timer_Sum ;
+						App.FB.Hall_Timer_Sum = 0;
+						App.FB.Cyc_Hall = 0;
+					}else{
 					App.FB.Hall_Timer_Sum =App.FB.Hall_Timer_Cnt +App.FB.Hall_Timer_Sum;
-					App.FB.Hall_Timer_Sum_Now = App.FB.Hall_Timer_Sum ;
-					App.FB.Hall_Timer_Sum = 0;
-					App.FB.Cyc_Hall = 0;
-				}else{
-				App.FB.Hall_Timer_Sum =App.FB.Hall_Timer_Cnt +App.FB.Hall_Timer_Sum;
+					}
 				}
 			}else if(App.Logic.Motor_Kind == 2){
-				App.FB2.Cyc_Hall ++;		//周期
-				App.FB2.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
-				TMR_SetCounter(TMR5,0);
+				if (HallOsc_CaptureEdge(2U) == 0U) /* 往复使用完整计时，其他模式原样执行旧测速。 */
+				{
+					App.FB2.Cyc_Hall ++;		//周期
+					App.FB2.Hall_Timer_Cnt = TMR_GetCounter(TMR5);
+					TMR_SetCounter(TMR5,0);
 
-				if(App.FB2.Cyc_Hall >=6){
+					if(App.FB2.Cyc_Hall >=6){
+						App.FB2.Hall_Timer_Sum =App.FB2.Hall_Timer_Cnt +App.FB2.Hall_Timer_Sum;
+						App.FB2.Hall_Timer_Sum_Now = App.FB2.Hall_Timer_Sum ;		//周期满传递值
+						App.FB2.Hall_Timer_Sum = 0;
+						App.FB2.Cyc_Hall = 0;
+					}else{
 					App.FB2.Hall_Timer_Sum =App.FB2.Hall_Timer_Cnt +App.FB2.Hall_Timer_Sum;
-					App.FB2.Hall_Timer_Sum_Now = App.FB2.Hall_Timer_Sum ;		//周期满传递值
-					App.FB2.Hall_Timer_Sum = 0;
-					App.FB2.Cyc_Hall = 0;
-				}else{
-				App.FB2.Hall_Timer_Sum =App.FB2.Hall_Timer_Cnt +App.FB2.Hall_Timer_Sum;
+					}
 				}
 			}
 			EXTI_ClearIntPendingBit(EXTI_Line12);  ///<Clear the  EXTI line 0 pending bit
@@ -456,14 +487,25 @@ void TMR6_GLOBAL_IRQHandler(void){
 
 
 //方波有霍尔，换相测速计时
+/*
+ * 函数功能：处理霍尔计时溢出，往复累计完整时间并保持其他模式原规则。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
 void TMR5_GLOBAL_IRQHandler(void){
 	 if(TMR_GetINTStatus(TMR5,TMR_INT_Overflow) == SET){
-		 if(App.Logic.Motor_Kind == 1){
-			 App.FB.Spd_Enable = 1;
-		 }
-		 if(App.Logic.Motor_Kind == 2){
-			 App.FB2.Spd_Enable = 1;
-		 }
+        if (HallOsc_TimerOverflow() != 0U) /* 往复分支已原子消费溢出，不能在返回前再次清掉新溢出。 */
+        {
+            return; /* 直接结束本次中断，避免重复清标志丢掉下一次5ms计数。 */
+        }
+        {
+			 if(App.Logic.Motor_Kind == 1){
+				 App.FB.Spd_Enable = 1;
+			 }
+			 if(App.Logic.Motor_Kind == 2){
+				 App.FB2.Spd_Enable = 1;
+			 }
+        }
 		 //太久没有换相应该报错
 		TMR_ClearITPendingBit(TMR5, TMR_INT_Overflow);
   }
