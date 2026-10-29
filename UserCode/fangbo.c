@@ -14,11 +14,115 @@
 #include "mcuart.h" /* 查询外部停止和输出锁定，阻止启动或换相覆盖停机。 */
 
 
+#define NOHALL2_SPEED_MIN_AGE_TICKS 1000UL /* 5us计数下的5ms下限，只限制PI测速年龄，不作为保护期限。 */
+#define NOHALL2_SPEED_MAX_AGE_TICKS 20000UL /* 5us计数下的100ms上限，原80000计数堵转保护保持独立。 */
+#define NOHALL2_SPEED_ALL_SECTORS 0x3FU /* 六位分别表示本轮已经取得六个真实换相区间。 */
+
+static volatile uint32_t s_nohall2_speed_version; /* 奇数表示换相中断正在更新，读者直接放弃本次使用，不等待中断。 */
+static volatile uint32_t s_nohall2_speed_age_limit = NOHALL2_SPEED_MAX_AGE_TICKS; /* 最近六个真实区间最大值的三倍，限制在5至100ms。 */
+static volatile uint8_t s_nohall2_speed_mask; /* 只由真实换相记录置位，开环强制换相不能放行PI。 */
+static volatile uint8_t s_nohall2_skip_interval; /* 切入闭环后的首段跨越开环边界，丢弃后再收集完整区间。 */
+static volatile uint8_t s_nohall2_pi_track_pending; /* 首次有效测速或恢复时只跟踪一次当前PWM，避免PI比例项造成接管跳变。 */
+static volatile uint8_t s_nohall2_speed_ready; /* ADC已经用完整有效区间更新调速反馈，供500us调速入口检查。 */
+
+/*
+ * 函数功能：在B路启动和闭环接管前清除新增测速记录，不改原保护计数或测速数组。
+ * 输入参数：无。
+ * 返回参数：无。
+ */
+void NoHall2_ResetSpeedValidity(void)
+{
+    ++s_nohall2_speed_version; /* 暂停读者使用记录，避免看到复位到一半的有效性状态。 */
+    s_nohall2_speed_mask = 0U; /* 本次运行必须重新收齐六个真实区间。 */
+    s_nohall2_speed_age_limit = NOHALL2_SPEED_MAX_AGE_TICKS; /* 尚无完整周期时使用100ms采集上限。 */
+    s_nohall2_skip_interval = 1U; /* 首次换相只建立起点，不能把开环拖动间隔算作闭环反馈。 */
+    s_nohall2_speed_ready = 0U; /* 原速度值保留给保护，PI暂时禁止使用。 */
+    s_nohall2_pi_track_pending = 1U; /* 新启动的首次有效速度必须与当前PWM平滑接管。 */
+    ++s_nohall2_speed_version; /* 完整发布复位结果，不屏蔽硬件保护中断。 */
+}
+
+/*
+ * 函数功能：在B路真实换相写入周期后登记新样本，丢失换相后重新收齐六个区间。
+ * 输入参数：hall_val为刚写入的相序1至6，interval为原5us计数器在清零前的读数。
+ * 返回参数：无。
+ */
+void NoHall2_RecordSpeedInterval(uint8_t hall_val, uint32_t interval)
+{
+    uint32_t max_interval = 0U; /* 只扫描六项已有数组，不新增速度换算或保护计数。 */
+    uint32_t cycle_ticks = 0U; /* 用完整六扇区总时间排除虚假超高速，允许单段换相不均匀。 */
+    uint32_t max_rpm = (uint32_t)MCPara2[13] * 10UL; /* 使用当前电机最高转速参数，保留与屏幕倍率的区别。 */
+    uint32_t age_limit; /* 用32位保存三倍间隔，避免16位乘法截断。 */
+    uint8_t i; /* 六区间扫描索引，只访问0至5。 */
+
+    ++s_nohall2_speed_version; /* ADC和PI可能抢占换相中断，奇数版本禁止读取半成品。 */
+    if ((s_nohall2_skip_interval != 0U) || (hall_val < 1U) || (hall_val > 6U) ||
+        (interval == 0U) || (interval > s_nohall2_speed_age_limit)) /* 零间隔、越界相序或跨越丢失时段不能用于闭环调速。 */
+    {
+        s_nohall2_speed_mask = 0U; /* 原六段资格全部作废，后续必须重新取得完整周期。 */
+        s_nohall2_speed_ready = 0U; /* 即使旧数组仍能算出转速，也不能继续推动PI。 */
+        s_nohall2_pi_track_pending = 1U; /* 新数据恢复后重新匹配当前PWM，不直接复用失效前积分。 */
+        s_nohall2_skip_interval = 0U; /* 本次边沿已建立新起点，下个区间可以重新登记。 */
+        s_nohall2_speed_age_limit = NOHALL2_SPEED_MAX_AGE_TICKS; /* 重采集使用100ms上限，不更改原0.4s保护。 */
+    }
+    else
+    {
+        s_nohall2_speed_mask |= (uint8_t)(1U << (hall_val - 1U)); /* 仅标记刚由真实换相写入的区间。 */
+        if (s_nohall2_speed_mask == NOHALL2_SPEED_ALL_SECTORS) /* 六项均被本轮真实换相覆盖后才计算年龄限制。 */
+        {
+            for (i = 0U; i < 6U; ++i) /* 不读取数组相邻字段。 */
+            {
+                cycle_ticks += App.FB2.OpenLoop.SpdCnt_Arr[i]; /* 累加完整周期，避免以某个短扇区直接拒绝真实换相。 */
+                if (App.FB2.OpenLoop.SpdCnt_Arr[i] > max_interval)
+                {
+                    max_interval = App.FB2.OpenLoop.SpdCnt_Arr[i]; /* 采用最慢区间，容纳一个周期内的换相不均匀。 */
+                }
+            }
+            if ((max_rpm == 0U) || (cycle_ticks < (6000000UL + max_rpm - 1UL) / max_rpm))
+            {
+                s_nohall2_speed_mask = 0U; /* 完整周期仍快于最高转速两倍才拒绝PI反馈，留出量化与短时超调余量。 */
+                s_nohall2_speed_ready = 0U; /* 此检查只撤销测速资格，实际硬件换相和原保护继续执行。 */
+                s_nohall2_pi_track_pending = 1U; /* 恢复可信周期后重新平滑接管当前PWM。 */
+                ++s_nohall2_speed_version; /* 异常返回前结束本次发布，不能永久留下奇数版本。 */
+                return; /* 不把毛刺产生的极高速度交给PI压低输出。 */
+            }
+            age_limit = max_interval * 3UL; /* 正常周期内允许三个最慢区间的样本年龄。 */
+            if (age_limit < NOHALL2_SPEED_MIN_AGE_TICKS)
+            {
+                age_limit = NOHALL2_SPEED_MIN_AGE_TICKS; /* 高速时至少保留5ms采样余量。 */
+            }
+            if (age_limit > NOHALL2_SPEED_MAX_AGE_TICKS)
+            {
+                age_limit = NOHALL2_SPEED_MAX_AGE_TICKS; /* 低速时最多保留100ms，过期只冻结PI。 */
+            }
+            s_nohall2_speed_age_limit = age_limit; /* 发布与当前六项数组对应的有效年龄。 */
+        }
+    }
+    ++s_nohall2_speed_version; /* 最后发布完整记录，原计数器仍由原换相代码复位。 */
+}
+
+/*
+ * 函数功能：只读判断B路六项真实测速是否完整且未过期，不改任何原保护变量。
+ * 输入参数：无。
+ * 返回参数：1表示可用于调速，0表示样本不完整、过期或正在更新。
+ */
+static uint8_t NoHall2_IsSpeedFresh(void)
+{
+    uint32_t version = s_nohall2_speed_version; /* 保存读取前版本，识别被ADC或换相更新打断的读取。 */
+    uint8_t fresh; /* 本次读取的完整性与年龄判断结果。 */
+
+    if ((version & 1U) != 0U)
+    {
+        return 0U; /* 不在高优先级中断里等待低优先级写者，避免阻塞保护调度。 */
+    }
+    fresh = (uint8_t)((s_nohall2_speed_mask == NOHALL2_SPEED_ALL_SECTORS) &&
+        (App.FB2.OpenLoop.Spd_NotHallCnt <= s_nohall2_speed_age_limit)); /* 只读原计数器；测速过期绝不替原保护清零。 */
+    return (uint8_t)((version == s_nohall2_speed_version) && (fresh != 0U)); /* 版本变化时本周期保守冻结，不接受混合记录。 */
+}
+
 #define HALL_OSC_TIMER_PERIOD_TICKS 50000UL /* TMR5每5ms溢出，保留原10MHz分辨率和其他模式配置。 */
 #define HALL_OSC_NO_EDGE_TICKS 1200000UL /* 120ms无有效霍尔后清测速；覆盖100rpm附近的正常边沿间隔。 */
-#define HALL_OSC_ASSIST_MAX_RPM 3000.0f /* 只给低速有霍尔往复助力，覆盖500刀具转速经常用减速比换算后的目标。 */
+#define HALL_OSC_ASSIST_REFERENCE_RPM 3000.0f /* 助力上限按电机目标转速线性缩放，达到此转速后封顶，不在门槛处突然撤销助力。 */
 #define HALL_OSC_ASSIST_TICKS 120U /* 500us控制周期累计60ms；每次启动助力只能执行一次。 */
-#define HALL_OSC_ASSIST_FIRST_PWM 600U /* 首段助力目标约8%，仍经过原PWM爬坡限制。 */
 #define HALL_OSC_ASSIST_MAX_PWM 1200U /* 助力阶段最多约16%，并受原通道PWM上限约束。 */
 #define HALL_OSC_ASSIST_PWM_STEP 20U /* 每500us增减助力20计数，限制静止启动和电流回退的变化量。 */
 
@@ -32,6 +136,7 @@ typedef struct
     uint16_t assist_ticks; /* 本次启动已经使用的500us助力节拍。 */
     uint16_t assist_pwm; /* 助力自身的受限PWM目标。 */
     uint8_t assist_active; /* 仅初始化时允许启动助力，运行中失速不自动重新触发。 */
+    uint8_t assist_releasing; /* 有效霍尔测速建立后只允许助力下降，本轮数据再丢失也不能重新加力。 */
 } HallOscState;
 
 static HallOscState s_hall_osc[2]; /* A/B分别保存测速与助力状态，切换通道不复用旧数据。 */
@@ -64,7 +169,7 @@ static void HallOsc_Invalidate(HallOscState *state, FANGBO_TYPEDEF *motor)
 }
 
 /*
- * 函数功能：首次启动和每次换向分别复位霍尔测速，并为低速往复准备一次有限助力。
+ * 函数功能：首次启动和每次换向分别复位霍尔测速，并准备一次从零缓升、限时退出的往复助力。
  * 输入参数：channel为无刷通道编号1或2。
  * 返回参数：无。
  */
@@ -90,9 +195,9 @@ static void HallOsc_Reset(uint8_t channel)
     TMR_SetCounter(TMR5, 0U); /* 清硬件计数，与软件高位保持同一基准。 */
     TMR_ClearITPendingBit(TMR5, TMR_INT_Overflow); /* 旧溢出不能计入新启动。 */
     state->assist_ticks = 0U; /* 每次合法启动重新拥有有限的60ms助力窗口。 */
-    state->assist_pwm = HALL_OSC_ASSIST_FIRST_PWM; /* 助力从受限的小占空比目标开始爬升。 */
-    state->assist_active = (uint8_t)((motor->Spd_Set > 0.0f) &&
-                                    (motor->Spd_Set <= HALL_OSC_ASSIST_MAX_RPM)); /* 高频往复高转速保持原速度PI。 */
+    state->assist_pwm = 0U; /* 不继承上一方向的助力，首次输出仍由原PI和PWM斜率决定。 */
+    state->assist_releasing = 0U; /* 新启动尚未建立可靠测速，后续只允许一次由升到降的切换。 */
+    state->assist_active = (uint8_t)(motor->Spd_Set > 0.0f); /* 正目标均使用连续的助力上限，高速PI足够时不抬高其输出。 */
     __set_PRIMASK(saved_mask); /* 恢复原中断状态。 */
 }
 
@@ -212,81 +317,103 @@ uint8_t HallOsc_CaptureEdge(uint8_t channel)
 }
 
 /*
- * 函数功能：为低速有霍尔往复建立一次受限起动力矩，并把实际输出平滑交给速度PI。
+ * 函数功能：为有霍尔往复叠加随目标转速连续变化的短时助力，可靠测速后缓退，60ms内退出且不改PI积分。
  * 输入参数：channel为通道1或2；requested_pwm为本周期原速度PI输出。
- * 返回参数：受启动期限、原PWM上限和原保护电流约束后的PWM目标。
+ * 返回参数：受助力幅度、剩余时间和原电流回退约束后的PWM目标，仍由原输出斜率与保护处理。
  */
 static int32_t HallOsc_ApplyStartupAssist(uint8_t channel, int32_t requested_pwm)
 {
-    HallOscState *state = &s_hall_osc[channel - 1U]; /* 两路助力期限分别计数。 */
-    FANGBO_TYPEDEF *motor = (channel == 1U) ? &App.FB : &App.FB2; /* 使用本路速度和保护电流。 */
-    mcParam_PIController *pi = (channel == 1U) ? &mcApp_VoltageP_PIParam : &mcApp_VoltageP_PIParam2; /* 回填本路PI，避免切环瞬间掉力。 */
-    int32_t limit = HALL_OSC_ASSIST_MAX_PWM; /* 助力绝不直接使用速度环的满量程输出。 */
+    HallOscState *state = &s_hall_osc[channel - 1U]; /* 两路独立记录助力进度，换向和换通道不能复用旧输出。 */
+    FANGBO_TYPEDEF *motor = (channel == 1U) ? &App.FB : &App.FB2; /* 只读取本路运行状态、目标和原保护电流。 */
+    mcParam_PIController *pi = (channel == 1U) ? &mcApp_VoltageP_PIParam : &mcApp_VoltageP_PIParam2; /* 保留本路PI计算出的积分，仅同步本次输出记录。 */
+    int32_t limit = HALL_OSC_ASSIST_MAX_PWM; /* 沿用原助力绝对上限，也保留电流回退分支的原上限。 */
+    int32_t assist_limit; /* 本轮目标转速允许的助力上限，不限制已经更高的正常PI需求。 */
+    uint32_t remaining_limit; /* 剩余节拍允许的助力值，保证按原下降步长能在60ms内归零。 */
     if ((state->assist_active == 0U) || (HallOsc_IsEnabled() == 0U))
     {
-        return requested_pwm; /* 未启用助力的运行路径逐值保持原PI结果。 */
+        return requested_pwm; /* 无霍尔、单向和已结束助力的路径逐值保留原PI输出。 */
     }
     if ((motor->Start == 0U) || (motor->AllRun == 0U) || (motor->Status != HS_RUN) ||
         (motor->Err != E_NONE) || (App.Logic.Brake_Sign != 0U) ||
         (MotorCommand_IsStopRequested() != 0U) || (MotorCommand_IsOutputLocked() != 0U) ||
-        (motor->Spd_Set <= 0.0f) || (motor->Spd_Set > HALL_OSC_ASSIST_MAX_RPM) ||
-        (motor->Prot.OverCurrent <= 0.0f))
+        (motor->Spd_Set <= 0.0f) || (motor->Prot.OverCurrent <= 0.0f))
     {
         state->assist_active = 0U; /* 停机、故障、换模式或无有效电流门限立即撤销助力。 */
         return requested_pwm; /* 输出关断仍由已有停机与保护路径优先执行。 */
     }
-    if ((state->assist_ticks >= HALL_OSC_ASSIST_TICKS) ||
-        ((state->samples >= 2U) && (fabsf(motor->Spd_Now) >= motor->Spd_Set * 0.6f)))
+    if (state->assist_ticks >= HALL_OSC_ASSIST_TICKS)
     {
-        state->assist_active = 0U; /* 转子已经建立运动或助力到期后，本次运行不再重新触发。 */
-        return requested_pwm; /* 前次已回填PI积分，正常速度环连续接管。 */
+        state->assist_active = 0U; /* 本次启动的60ms期限不延长，运行中不会重新触发。 */
+        return requested_pwm; /* 助力正常退到零后完整交回原PI。 */
     }
-    ++state->assist_ticks; /* 每次只消耗一个500us启动节拍。 */
     if (pi->qOutMax < (float)limit)
     {
-        limit = (int32_t)pi->qOutMax; /* 原通道PWM上限比助力上限更小时仍以原上限为准。 */
+        limit = (int32_t)pi->qOutMax; /* 原通道输出上限更小时仍使用原配置。 */
     }
     if ((limit <= 0) || (pi->qOutMin > (float)limit))
     {
-        state->assist_active = 0U; /* 不覆盖已有的特殊PWM范围配置。 */
-        return requested_pwm; /* 保留原配置行为。 */
+        state->assist_active = 0U; /* 特殊PWM范围不允许本辅助逻辑覆盖。 */
+        return requested_pwm; /* 保留原配置和原速度环行为。 */
+    }
+    ++state->assist_ticks; /* 每次调用消耗一个原500us节拍，助力退出不会重置计时。 */
+    if (state->samples >= 2U)
+    {
+        state->assist_releasing = 1U; /* 两个连续正确霍尔间隔已能测速，此后只缓退，不再等待固定转速比例。 */
     }
     if (motor->Prot.AllCur >= motor->Prot.OverCurrent * 0.8f)
     {
-        requested_pwm = App.Logic.VBusNowPWM - (int32_t)HALL_OSC_ASSIST_PWM_STEP; /* 接近原保护电流时先减力，保护门限本身不变。 */
+        requested_pwm = App.Logic.VBusNowPWM - (int32_t)HALL_OSC_ASSIST_PWM_STEP; /* 沿用原80%保护电流处的减力动作，不修改保护阈值。 */
         if (requested_pwm < 0)
         {
-            requested_pwm = 0; /* 电流回退不能产生负PWM。 */
+            requested_pwm = 0; /* 沿用原电流回退零下限，禁止写入负PWM。 */
         }
-        state->assist_pwm = (uint16_t)requested_pwm; /* 助力缓存跟随回退值，下一周期不能恢复旧高输出。 */
+        if (requested_pwm > limit)
+        {
+            requested_pwm = limit; /* 沿用原电流回退的助力绝对上限。 */
+        }
+        state->assist_pwm = (uint16_t)requested_pwm; /* 下个周期不能恢复电流回退之前的旧助力。 */
     }
     else
     {
-        state->assist_pwm += HALL_OSC_ASSIST_PWM_STEP; /* 在短启动窗口内逐步建立克服静摩擦的输出。 */
-        if (state->assist_pwm > (uint16_t)limit)
+        assist_limit = limit; /* 达到参考转速后助力封顶，但正常PI更高时仍保留正常PI。 */
+        if (motor->Spd_Set < HALL_OSC_ASSIST_REFERENCE_RPM)
         {
-            state->assist_pwm = (uint16_t)limit; /* 助力爬升不能越过本次有效上限。 */
+            assist_limit = (int32_t)((float)HALL_OSC_ASSIST_MAX_PWM * motor->Spd_Set / HALL_OSC_ASSIST_REFERENCE_RPM); /* 低目标按比例减小助力，避免低档固定给满1200。 */
+            if (assist_limit > limit)
+            {
+                assist_limit = limit; /* 缩放后仍服从原通道PWM上限。 */
+            }
+        }
+        remaining_limit = (uint32_t)(HALL_OSC_ASSIST_TICKS - state->assist_ticks) * HALL_OSC_ASSIST_PWM_STEP; /* 提前为助力下降保留时间，期限到达时上限必为零。 */
+        if ((uint32_t)assist_limit > remaining_limit)
+        {
+            assist_limit = (int32_t)remaining_limit; /* 没有测速时也在原60ms窗口内平滑退出。 */
+        }
+        if (state->assist_releasing != 0U)
+        {
+            state->assist_pwm = (state->assist_pwm > HALL_OSC_ASSIST_PWM_STEP) ?
+                (uint16_t)(state->assist_pwm - HALL_OSC_ASSIST_PWM_STEP) : 0U; /* 可靠测速后每500us最多撤去20计数助力，不突然切掉整个输出下限。 */
+        }
+        else
+        {
+            state->assist_pwm += HALL_OSC_ASSIST_PWM_STEP; /* 从零按原步长建立短时输出，不直接跳到固定600。 */
+        }
+        if (state->assist_pwm > (uint16_t)assist_limit)
+        {
+            state->assist_pwm = (uint16_t)assist_limit; /* 同时落实目标转速、原PWM范围和剩余时间的限制。 */
         }
         if (requested_pwm < (int32_t)state->assist_pwm)
         {
-            requested_pwm = state->assist_pwm; /* 启动期给速度PI提供受限的输出下限。 */
+            requested_pwm = state->assist_pwm; /* 仅在原PI不足时补到受限助力，正常更高的PI输出不被截低。 */
+        }
+        if (((state->assist_releasing != 0U) && (state->assist_pwm == 0U)) ||
+            (state->assist_ticks >= HALL_OSC_ASSIST_TICKS))
+        {
+            state->assist_active = 0U; /* 助力已撤完或期限到达，本轮测速再次丢失也不重新加力。 */
         }
     }
-    if (requested_pwm > limit)
-    {
-        requested_pwm = limit; /* 助力期间的最终目标也必须受上限约束。 */
-    }
-    pi->qdSum = (float)requested_pwm - pi->qKp * pi->qErr; /* 以本次实际目标回填积分，退出助力时避免掉回零输出。 */
-    if (pi->qdSum < 0.0f)
-    {
-        pi->qdSum = 0.0f; /* 与原PI的非负积分约束保持一致。 */
-    }
-    if (pi->qdSum > pi->qdSumMax)
-    {
-        pi->qdSum = pi->qdSumMax; /* 不放宽原积分上限。 */
-    }
-    pi->qOut = (float)requested_pwm; /* PI输出状态与即将下发的受限目标保持一致。 */
-    return requested_pwm; /* 仍由原PWM爬坡和硬件写入路径执行。 */
+    pi->qOut = (float)requested_pwm; /* 仅同步输出记录；积分继续由原PI及抗饱和计算更新，不灌入助力。 */
+    return requested_pwm; /* 原PWM升降斜率、硬件输出门禁及全部保护仍在后续原路径执行。 */
 }
 
 //132645 
@@ -403,9 +530,11 @@ void HallSqu_ADCISRTasks(void){
 		if(App.FB2.AllRun == 1){
 			if(App.FB2.OpenLoop.StartHallOkFg == 1 ){	//相序正确
 				//计算速度
-					for(i = 0 ; i<7 ;i++){
-						App.FB2.OpenLoop.SpdSum += App.FB2.OpenLoop.SpdCnt_Arr[i];				//累计6次换向的全部时间，更加准
+					uint32_t speed_sum = 0U; /* 本次独立累加六个区间，避免上次残值进入测速。 */
+					for(i = 0 ; i<6 ;i++){ /* 数组只有0至5六项，禁止读到相邻字段。 */
+						speed_sum += App.FB2.OpenLoop.SpdCnt_Arr[i]; /* 保留每个区间原5us计时单位。 */
 					}
+					App.FB2.OpenLoop.SpdSum = speed_sum; /* 六项累加完成后再发布，原方向、换算和滤波不变。 */
 					if(App.FB2.OpenLoop.SpdSum != 0 ){
 						if(App.FB2.Dir.Now ==CW){
 							App.FB2.RadFilTemp2 =1000000*(2.0f*M_PI)/(App.FB2.OpenLoop.SpdSum * 5.0f);				//0.000005
@@ -416,13 +545,30 @@ void HallSqu_ADCISRTasks(void){
 							App.FB2.Spd_Now = App.FB2.RadFilTemp2*(60.0f)/(2.0f*M_PI);		//1对极		角速度转化为rpm
 						}
 						App.FB2.Rad_Now = App.FB2.RadFilTemp2*0.1f + App.FB2.Rad_Now*0.9f;
+                    if ((s_nohall2_speed_version & 1U) == 0U) /* 换相记录正在写入时暂缓发布，不能把一次抢占误当成测速丢失。 */
+                    {
+                        if (NoHall2_IsSpeedFresh() != 0U) /* 仅完整且未过期的真实区间允许调速使用。 */
+                        {
+                            if (s_nohall2_speed_ready == 0U)
+                            {
+                                App.FB2.Rad_Now = App.FB2.RadFilTemp2; /* 恢复时用新周期重置滤波起点，避免旧反馈继续压低PI。 */
+                            }
+                            s_nohall2_speed_ready = 1U; /* 先完成新速度计算，再通知500us调速入口。 */
+                        }
+                        else
+                        {
+                            s_nohall2_speed_ready = 0U; /* Spd_Now保留原计算，低速堵转保护的输入规则不变。 */
+                        }
+                    }
 					App.FB2.OpenLoop.SpdSum = 0;
 				}
 			}else if(App.FB2.OpenLoop.StartHallOkFg == 0){	//相序还不正确
 				//计算速度
-					for(i = 0 ; i<7 ;i++){
-						App.FB2.OpenLoop.SpdSum += App.FB2.OpenLoop.SpdCnt_Arr[i];				//累计6次换向的全部时间，更加准
+					uint32_t speed_sum = 0U; /* 本次独立累加六个区间，避免上次残值进入测速。 */
+					for(i = 0 ; i<6 ;i++){ /* 数组只有0至5六项，禁止读到相邻字段。 */
+						speed_sum += App.FB2.OpenLoop.SpdCnt_Arr[i]; /* 保留每个区间原5us计时单位。 */
 					}
+					App.FB2.OpenLoop.SpdSum = speed_sum; /* 六项累加完成后再发布，原方向、换算和滤波不变。 */
 					if(App.FB2.OpenLoop.SpdSum != 0 ){
 					App.FB2.Rad_Now =1000000*(2.0f*M_PI)/(App.FB2.OpenLoop.SpdSum * 5.0f);				//0.000005
 					App.FB2.Spd_Now = App.FB2.Rad_Now*(60.0f)/(2.0f*M_PI);		//1对极	
@@ -745,7 +891,7 @@ void Hall_Vbus_PI_Out(void){
 
 //	根据速度去电压闭环
 /*
- * 函数功能：执行B路原速度PI与PWM爬坡，仅低速有霍尔往复增加受限启动助力。
+ * 函数功能：B路无霍尔测速有效时执行原PI，失效时冻结；有霍尔往复保持原受限助力。
  * 输入参数：无。
  * 返回参数：无。
  */
@@ -753,6 +899,27 @@ void Hall_Vbus_PI_Out2(void){
 	volatile int32_t temp_pwm = 0;
 	float PWM_UP2 	 = 0;
 	float PWM_Down2 = 0;
+    if (App.Logic.LogicHall_or_pll == 1U) /* 本次门禁仅用于B路无霍尔闭环，不改变有霍尔调速。 */
+    {
+        if ((App.Logic.Motor_Kind != 2U) || (App.FB2.AllRun != 1U) || (App.FB2.Status != HS_RUN) ||
+            (App.FB2.Start == 0U) || (App.FB2.Err != E_NONE) || (App.Logic.Brake_Sign != 0U) ||
+            (MotorCommand_IsStopRequested() != 0U))
+        {
+            return; /* 停止、换向和故障交回原调度处理，本入口不能保持或重写硬件输出。 */
+        }
+        if ((s_nohall2_speed_version & 1U) != 0U)
+        {
+            App.Logic.VBusSetPWM = App.Logic.VBusNowPWM; /* 仅因正常换相记录正在发布时暂缓一次PI，不重置积分接管状态。 */
+            return; /* 等待下一调速周期读取完整记录，高优先级中断不能等待被抢占的写者。 */
+        }
+        if ((s_nohall2_speed_ready == 0U) || (NoHall2_IsSpeedFresh() == 0U))
+        {
+            s_nohall2_pi_track_pending = 1U; /* 只标记下次有效反馈需要接管，失效期间不修改原积分。 */
+            App.Logic.VBusSetPWM = App.Logic.VBusNowPWM; /* 撤销旧PI目标，最多保持当前PWM；当前为零就继续为零。 */
+            return; /* 跳过PI、积分、最小PWM限幅和硬件重写，不主动增加输出；原保护仍独立执行。 */
+        }
+    }
+
 	
 	if(App.Logic.LogicHall_or_pll == 1){
 		PWM_UP2 	 = MCPara2[64];
@@ -773,6 +940,25 @@ void Hall_Vbus_PI_Out2(void){
 		//Buck期望值给定
 		mcApp_VoltageP_PIParam2.qInRef  = App.FB2.Rad_Set;
 		//Buck的PI计算
+        if ((App.Logic.LogicHall_or_pll == 1U) && (s_nohall2_pi_track_pending != 0U))
+        {
+            mcApp_VoltageP_PIParam2.qErr = mcApp_VoltageP_PIParam2.qInRef - mcApp_VoltageP_PIParam2.qInMeas; /* 用本次新反馈计算接管误差。 */
+            mcApp_VoltageP_PIParam2.qdSum = App.Logic.VBusNowPWM - mcApp_VoltageP_PIParam2.qKp * mcApp_VoltageP_PIParam2.qErr; /* 抵消首次比例项，使PI从当前实际PWM连续开始。 */
+            if (mcApp_VoltageP_PIParam2.qdSum < 0.0f)
+            {
+                mcApp_VoltageP_PIParam2.qdSum = 0.0f; /* 保留原PI非负积分限制，不通过负积分改变运行策略。 */
+            }
+            if (mcApp_VoltageP_PIParam2.qdSum > mcApp_VoltageP_PIParam2.qdSumMax)
+            {
+                mcApp_VoltageP_PIParam2.qdSum = mcApp_VoltageP_PIParam2.qdSumMax; /* 保留原积分上限，后续PWM仍走原输出限幅和斜率。 */
+            }
+            if (mcApp_VoltageP_PIParam2.qdSum > mcApp_VoltageP_PIParam2.qOutMax)
+            {
+                mcApp_VoltageP_PIParam2.qdSum = mcApp_VoltageP_PIParam2.qOutMax; /* 与原PI中的输出上限约束一致。 */
+            }
+            mcApp_VoltageP_PIParam2.qOut = App.Logic.VBusNowPWM; /* 同步接管输出记录，不直接写硬件。 */
+            s_nohall2_pi_track_pending = 0U; /* 本次接管只执行一次，后续恢复原PI积分调速。 */
+        }
 		mcLib_CalcPI(&mcApp_VoltageP_PIParam2);
 		//输出值给temp；
 		temp_pwm = (uint16_t)mcApp_VoltageP_PIParam2.qOut;
@@ -892,8 +1078,8 @@ void HallSqu_Init(void){
 	TIME1_PWM_Stop_3Channel();		//防止有刷一起转
 	TIME8_PWM_Stop_3Channel();		//防止有刷一起转
 	PVCC_PWM_ON;
-	for(i = 0 ; i<7 ;i++){			//清空初始化速度计算数组
-		App.FB.OpenLoop.SpdCnt_Arr[i] = 0;
+	for(i = 0 ; i<6 ;i++){ /* 数组只有六项，启动清理禁止写入相邻内存。 */
+		App.FB.OpenLoop.SpdCnt_Arr[i] = 0; /* 清除本路旧周期，不改任何保护计数。 */
 	}
 	if(App.Logic.CtlMode == 1 || App.Logic.CtlMode == 2 ||App.Logic.CtlMode ==3 ){
 		if(App.Logic.LogicHall_or_pll == 2){	
@@ -980,8 +1166,8 @@ void HallSqu_Init2(void){
 	TIME1_PWM_Stop_3Channel();		//防止有刷一起转
 	TIME8_PWM_Stop_3Channel();		//防止有刷一起转
 	PVCC_PWM_ON;
-	for(i = 0 ; i<7 ;i++){				//清空初始化速度计算数组
-		App.FB2.OpenLoop.SpdCnt_Arr[i] = 0;
+	for(i = 0 ; i<6 ;i++){ /* 数组只有六项，启动清理禁止写入相邻内存。 */
+		App.FB2.OpenLoop.SpdCnt_Arr[i] = 0; /* 清除本路旧周期，不改任何保护计数。 */
 	}
 	if(App.Logic.CtlMode == 1 || App.Logic.CtlMode == 2 ||App.Logic.CtlMode ==3 ){
 		if(App.Logic.LogicHall_or_pll == 2){		//有霍尔
@@ -1198,6 +1384,17 @@ void HallSqu_Charge2(void){
 			if(App.Logic.CtlMode == 1 ||App.Logic.CtlMode ==2||App.Logic.CtlMode ==3){
 				//区分是有霍尔还是无霍尔，有霍尔转入运行去闭环，无霍尔的话就需要初始化参数去开环
 				if(App.Logic.LogicHall_or_pll == 1){
+					NoHall2_ResetSpeedValidity(); /* 新一轮无霍尔启动清除测速资格，不继承上次运行数据。 */
+                    NoHall2_ResetStartup(); /* 新启动重新采集比较器边沿，不能复用上次故障的扇区资格。 */
+                    App.FB2.OpenLoop.StepRampCnt = 0U; /* 从拖动表初始慢速段重新起步。 */
+                    App.FB2.OpenLoop.OpenStartTimCnt = 0U; /* 清除上一扇区的残余等待时间。 */
+                    App.FB2.OpenLoop.HallStartStepCnt = 0; /* 首次强制换相重新从固定表位置按当前方向推进。 */
+                    App.FB2.OpenLoop.HallVal = 0; /* 第一次实际强制换相前没有可用于检测的驱动扇区。 */
+                    App.FB2.OpenLoop.ClossLoopFlg = 0U; /* 撤销上一轮闭环接管标志。 */
+                    App.FB2.OpenLoop.OpenStart1msFg = 0U; /* 等待本轮新的1ms启动节拍，不消费旧标志。 */
+                    App.FB2.OpenLoop.SpdSum = 0U; /* 六项数组已在初始化清理，累计值也不能继承。 */
+                    App.FB2.Rad_Now = 0.0f; /* 新一轮反馈不继承上一方向的角速度。 */
+                    App.FB2.Spd_Now = 0.0f; /* 启动前测量状态归零，原低速保护仍按其原规则累计。 */
 					RAMP_TABLE_Init2(1000,(float)MCPara2[26]/1000.0f);
 					//启动方式是Vbus，启动力量给定值，限制一下开环BUCK输出的最大最小值
 					App.FB2.OpenLoop.PwmUp = MCPara2[29];
@@ -1337,6 +1534,24 @@ void HallSqu_Start2(void){
         App.FB2.Status = HS_BRA; /* 开环爬坡前先响应停止，交给原制动斜率撤销输出。 */
         return; /* 本周期不能再增加启动PWM或发布闭环运行。 */
     }
+    if ((App.Logic.LogicHall_or_pll == 1U) &&
+        ((MCPara2[30] >= NOHALL2_START_TIMEOUT_MS) ||
+         (App.FB2.OpenLoop.OpenLoopTime >= NOHALL2_START_TIMEOUT_MS)))
+    {
+        if (App.FB2.Err == E_NONE)
+        {
+            App.FB2.Err = E_Start; /* 参数要求无法在期限内接管或1s仍未成功，新增启动失败兜底不覆盖原故障。 */
+        }
+    }
+    if (App.FB2.Err != E_NONE)
+    {
+        App.FB2.BraTimCnt = 0; /* 沿用原错误退出的制动计数处理。 */
+        App.FB2.AllRun = 0; /* 沿用原故障运行许可撤销，错误期间不能继续开环加PWM。 */
+        App.FB2.Status = HS_ERR; /* 交回原错误状态机统一锁存与回报。 */
+        PWM_3l_Stop2(); /* 使用原B路关断函数，不修改过流和堵转关断路径。 */
+        return; /* 故障确认后不再产生本周期启动输出。 */
+    }
+
 					//没有开环，那就直接转闭环
 	
 	if(App.Logic.LogicHall_or_pll == 1 ){
@@ -1354,6 +1569,10 @@ void HallSqu_Start2(void){
 					App.Logic.VBusNowPWM  =	App.FB2.OpenLoop.MinPwm;
 				}							
 			}
+            if (App.Logic.VBusNowPWM < 0)
+            {
+                App.Logic.VBusNowPWM = 0; /* 恒流回退到零后不能继续减成负数并写入无符号比较寄存器。 */
+            }
 			TMR_SetCompare4(TMR2, App.Logic.VBusNowPWM);			//固定的PWM去拖，先托起来，调节MCPara[132]可以暂时调节，后面更改成爬坡
 			//启动拖
 			App.FB2.OpenLoop.OpenStartTimCnt ++;

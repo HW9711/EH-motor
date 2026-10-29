@@ -4,6 +4,7 @@
 #include "mcctl.h"
 
 #define STEP_RAMP_SIZE 64
+#define NOHALL2_START_TIMEOUT_MS 1000U /* Æô¶¯×î¶àÇ¿ÖÆÍÏ¶¯1s£¬Î´½Ó¹Ü×ßÔ­´íÎó¹Ø¶Ï£»²»ĞŞ¸ÄÔ­¹ıÁ÷»ò¶Â×ªÆÚÏŞ¡£ */
 void Hall_PhaseChange(u8 hall_val,u16 pwm);
 void Hall_PhaseChange2(u8 hall_val,u16 pwm);
 
@@ -24,6 +25,9 @@ uint8_t HallOsc_TimerOverflow(void); /* ½öÓĞ»ô¶ûÍù¸´ÀÛ¼ÆTMR5Òç³ö£¬ÆäËûÄ£Ê½·µ»Ø0¡
 void HallSqu_ADCISRTasks(void);
 void Hall_Vbus_PI_Out(void);
 void Hall_Vbus_PI_Out2(void);
+void NoHall2_ResetStartup(void); /* ĞÂÆô¶¯Ç°Çå³ıBÂ·±È½ÏÆ÷±ßÑØ×Ê¸ñ¡£ */
+void NoHall2_ResetSpeedValidity(void); /* BÂ·Æô¶¯ºÍ±Õ»·½Ó¹ÜÊ±¸´Î»¶ÀÁ¢²âËÙ×Ê¸ñ£¬²»¸ÄÔ­±£»¤¼ÆÊı¡£ */
+void NoHall2_RecordSpeedInterval(uint8_t hall_val, uint32_t interval); /* Ö»ÔÚBÂ·ÕæÊµ»»ÏàĞ´ÖÜÆÚºóµ÷ÓÃ£¬intervalÎªÔ­5us¼ÆÊı¡£ */
 
 
 

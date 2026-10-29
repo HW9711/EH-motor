@@ -1,4 +1,5 @@
 #include "driver_param.h"
+#include "driver_software_version.h" /* 只在本模块实例化软件版本记录缓存。 */
 
 #include "mcctl.h"
 #include "mcflash.h"
@@ -187,6 +188,7 @@ static void DriverParam_SendWriteOk(USART_Type *USARTx, MCUART_Type *seruart)
  */
 void DriverParam_Init(void)
 {
+    DriverSwVersion_Init(); /* 软件初始化期间计算一次固件CRC，后续查询只返回缓存，不影响运行周期。 */
     F4Flash_SMCPara_Read(TEST_FLASH_ADDRESS_START_YS1, YSPara1, ParaNum, SYSPara1); /* 页103有效则读Flash，否则复制通道1编译默认。 */
     F4Flash_SMCPara_Read(TEST_FLASH_ADDRESS_START_YS2, YSPara2, ParaNum, SYSPara2); /* 页104有效则读Flash，否则复制通道2编译默认。 */
 
@@ -237,6 +239,21 @@ uint8_t DriverParam_TryHandle(USART_Type *USARTx, MCUART_Type *seruart)
         return 1U; /* 维护协议要求精确8字节和真实CRC，不保留旧0xAABB旁路。 */
     }
 
+    if (seruart->FunCode == 0x03U && seruart->R_DATA[2] == 0x7EU)
+    {
+        if (seruart->R_DATA[3] != 0U || seruart->R_DATA[4] != 0U || seruart->R_DATA[5] != 16U)
+        {
+            DriverParam_SendError(USARTx, seruart, 0x83U, 0x02U); /* 版本只允许从7E00整读16寄存器，禁止截断或越界。 */
+            return 1U; /* 版本请求已消费，不进入参数读写。 */
+        }
+        seruart->T_DATA[0] = DRIVER_PARAM_ADDRESS; /* 使用既有FD维护链路，不改变AA运行帧。 */
+        seruart->T_DATA[1] = 0x03U; seruart->T_DATA[2] = 32U; /* 返回32字节版本记录。 */
+        for (item = 0U; item < 32U; ++item) seruart->T_DATA[3U + item] = s_driver_sw_record[item]; /* 仅复制启动时缓存。 */
+        seruart->TxCRC = CRC_Calc(seruart->T_DATA, 35U); /* 响应头和完整记录均参与真实CRC。 */
+        seruart->T_DATA[35] = (uint8_t)seruart->TxCRC; seruart->T_DATA[36] = (uint8_t)(seruart->TxCRC >> 8); /* 低字节先发。 */
+        Modbus_Send(USARTx, seruart->T_DATA, 37U); /* 不修改任何运行参数或Flash。 */
+        return 1U; /* 查询到此完成。 */
+    }
     if (seruart->FunCode == 0x03U)
     {
         bank = seruart->R_DATA[2]; /* 03寄存器高字节直接表示Bank。 */
