@@ -10,6 +10,9 @@
 #include "YSmcctl.h"
 #include "YSstatemachine.h"
 #include "driver_param.h"
+#include "protect.h" /* 所有参数22/24入口共用合法性检查和运行时装载规则。 */
+#define MOTOR_PROTECTION_FRAME_ADDRESS 0xABU /* 新运行帧与旧0xAA明确区分，避免旧驱动误执行。 */
+#define MOTOR_PROTECTION_FRAME_LENGTH 15U /* 新帧byte9~12为两项大端毫秒，CRC覆盖前13字节。 */
 #define IDNE_TIM    20
 #define MOTOR_COMMAND_FRAME_LENGTH 11U /* 手柄控制帧固定为11字节，末2字节必须是CRC16。 */
 #define MOTOR_COMMAND_FREQUENCY_MAX 100U /* 往复频率命令上限为100，防止乘2后发生8位回绕。 */
@@ -291,7 +294,7 @@ extern void TIM_Motor_PWM(TMR_Type* TMRx);
 volatile uint8_t YSorWSFlag = 1;		//有刷还是无刷 1-无刷 2有刷
 	
 /*
- * 函数功能：校验11字节手柄控制帧的模式、电机类型和闭环类型组合是否属于已定义协议。
+ * 函数功能：校验11/15字节控制帧的地址长度、模式和电机类型，时间非法由装载处独立回退。
  * 输入参数：seruart 为已经完成长度和CRC计算的串口接收上下文。
  * 返回参数：字段语义有效返回1，否则返回0且本帧不得刷新通信租约。
  */
@@ -300,7 +303,8 @@ static uint8_t MotorCommand_IsSemanticallyValid(const MCUART_Type *seruart)
 	uint8_t motor_kind; /* 保存协议byte3的电机类型，1/2为无刷，3/4为有刷。 */
 	uint8_t run_type; /* 保存协议byte6的运行反馈类型，必须与电机类型匹配。 */
 
-	if((seruart == 0) || (seruart->RxLen != MOTOR_COMMAND_FRAME_LENGTH))
+	if((seruart == 0) || (((seruart->Addr != 0xAAU) || (seruart->RxLen != MOTOR_COMMAND_FRAME_LENGTH)) &&
+        ((seruart->Addr != MOTOR_PROTECTION_FRAME_ADDRESS) || (seruart->RxLen != MOTOR_PROTECTION_FRAME_LENGTH))))
 	{
 		return 0U; /* 空上下文或非固定长度不能作为手柄控制命令。 */
 	}
@@ -546,7 +550,8 @@ void Modbus_Ctl(USART_Type* USARTx, MCUART_Type *seruart){
 						if(seruart->UpdateRegL >= ParaNum){
 							ModbusErrorResponse(USARTx,seruart,0x83,2);
 						}else {
-							if(seruart->UpdatePara > 32767){
+							if((seruart->UpdatePara > 32767) || (((seruart->UpdateRegL == 22U) || (seruart->UpdateRegL == 24U)) &&
+                                (seruart->UpdatePara != Protect_ValidateTime(seruart->UpdatePara)))){ /* 旧维护地址也不得写入越界保护时间。 */
 								ModbusErrorResponse(USARTx,seruart,0x83,3);
 							}else {
 								MCPara[seruart->UpdateRegL] = seruart->UpdatePara;
@@ -561,7 +566,8 @@ void Modbus_Ctl(USART_Type* USARTx, MCUART_Type *seruart){
 						if(seruart->UpdateRegL >= ParaNum){
 							ModbusErrorResponse(USARTx,seruart,0x83,2);
 						}else {
-							if(seruart->UpdatePara > 32767){
+							if((seruart->UpdatePara > 32767) || (((seruart->UpdateRegL == 22U) || (seruart->UpdateRegL == 24U)) &&
+                                (seruart->UpdatePara != Protect_ValidateTime(seruart->UpdatePara)))){ /* 旧维护地址也不得写入越界保护时间。 */
 								ModbusErrorResponse(USARTx,seruart,0x83,3);
 							}else {
 								MCPara2[seruart->UpdateRegL] = seruart->UpdatePara;
@@ -732,7 +738,8 @@ void Modbus_Ctl(USART_Type* USARTx, MCUART_Type *seruart){
 						if(seruart->UpdateRegL >= ParaNum){
 							ModbusErrorResponse(USARTx,seruart,0x83,2);
 						}else {
-							if(seruart->UpdatePara > 32767){
+							if((seruart->UpdatePara > 32767) || (((seruart->UpdateRegL == 22U) || (seruart->UpdateRegL == 24U)) &&
+                                (seruart->UpdatePara != Protect_ValidateTime(seruart->UpdatePara)))){ /* 旧维护地址也不得写入越界保护时间。 */
 								ModbusErrorResponse(USARTx,seruart,0x83,3);
 							}else {
 								MCPara2[seruart->UpdateRegL] = seruart->UpdatePara;
@@ -796,9 +803,9 @@ void Modbus_Ctl(USART_Type* USARTx, MCUART_Type *seruart){
 		}		
 		
 		else if(	//私有协议：判断有无刷、有无Hall、刹车类型、保护电流
-			(seruart->Addr == 0xAA) /* 私有手柄控制帧固定地址。 */
-			&& (seruart->CalcCRC == seruart->RxCRC) /* 只接受真实CRC，禁止历史AABB旁路续租。 */
-			&& seruart->RxLen == 11
+			(((seruart->Addr == 0xAAU) && (seruart->RxLen == MOTOR_COMMAND_FRAME_LENGTH)) ||
+             ((seruart->Addr == MOTOR_PROTECTION_FRAME_ADDRESS) && (seruart->RxLen == MOTOR_PROTECTION_FRAME_LENGTH))) /* 地址和长度必须严格配对。 */
+            && (seruart->CalcCRC == seruart->RxCRC) /* 两项时间也必须通过CRC，坏帧不能续租或更改保护。 */
 		){
 
 			if(MotorCommand_IsSemanticallyValid(seruart) == 0U)
@@ -808,6 +815,10 @@ void Modbus_Ctl(USART_Type* USARTx, MCUART_Type *seruart){
 
             command_primask = __get_PRIMASK(); /* 从发布目标到发布模式均在同一短临界区内，不能混用新旧控制字段。 */
             __disable_irq(); /* 不允许ADC或500us状态机看到半份运行命令。 */
+            Protect_ApplyCommandTimes(seruart->R_DATA[3],
+                (seruart->Addr == MOTOR_PROTECTION_FRAME_ADDRESS) ? (uint16_t)(((uint16_t)seruart->R_DATA[9] << 8U) | seruart->R_DATA[10]) : MOTOR_OVERCURRENT_TIME_DEFAULT_MS,
+                (seruart->Addr == MOTOR_PROTECTION_FRAME_ADDRESS) ? (uint16_t)(((uint16_t)seruart->R_DATA[11] << 8U) | seruart->R_DATA[12]) : MOTOR_OVERCURRENT_TIME_DEFAULT_MS,
+                MotorCommand_AreChannelsQuiescent()); /* 新帧与运动状态同一临界区发布；旧帧明确500/500，重复帧不清计数。 */
             if (s_motor_stop_fault != 0U)
             {
                 App.Logic.HandShakeProtCnt = 0U; /* 合法帧仍允许故障通信，但不能解除停机锁存。 */
@@ -1071,7 +1082,38 @@ uint16_t CRC_Calc(unsigned char *snd, unsigned char num)
 
 
 
-//特殊指令返回
+/*
+ * 函数功能：按请求版本回复完整反馈，新版额外报告实际采用的两项时间。
+ * 输入参数：USARTx为串口；seruart的前10字节已填好运行状态。
+ * 返回参数：无；CRC覆盖新反馈时间，不把Flash参数冒充手柄运行值。
+ */
+static void MotorCommand_SendFeedback(USART_Type* USARTx, MCUART_Type* seruart)
+{
+    uint16_t time22; /* 当前物理通道实际采用的往复保护时间。 */
+    uint16_t time24; /* 当前物理通道实际采用的无霍尔保护时间。 */
+    seruart->SendLen = 10U; /* 旧主控仍收到原12字节帧，保持兼容。 */
+    if (seruart->Addr == MOTOR_PROTECTION_FRAME_ADDRESS)
+    {
+        time22 = (uint16_t)(((seruart->T_DATA[3] == 2U) || (seruart->T_DATA[3] == 4U)) ? App.FB2.Prot.OverCurrentCnt2 : App.FB.Prot.OverCurrentCnt2); /* 反馈跟随实际物理通道。 */
+        time24 = (uint16_t)(((seruart->T_DATA[3] == 2U) || (seruart->T_DATA[3] == 4U)) ? App.FB2.Prot.OverCurrentCnt3 : App.FB.Prot.OverCurrentCnt3); /* 不把请求值代替实际缓存值。 */
+        seruart->T_DATA[0] = MOTOR_PROTECTION_FRAME_ADDRESS; /* 新地址确认驱动支持完整运行帧。 */
+        seruart->T_DATA[10] = (uint8_t)(time22 >> 8U); /* 参数22大端高字节。 */
+        seruart->T_DATA[11] = (uint8_t)time22; /* 参数22大端低字节。 */
+        seruart->T_DATA[12] = (uint8_t)(time24 >> 8U); /* 参数24大端高字节。 */
+        seruart->T_DATA[13] = (uint8_t)time24; /* 参数24大端低字节。 */
+        seruart->SendLen = 14U; /* 新回复前14字节全部参与CRC。 */
+    }
+    seruart->TxCRC = CRC_Calc(seruart->T_DATA, seruart->SendLen); /* 校验整个实际反馈版本。 */
+    seruart->T_DATA[seruart->SendLen] = (uint8_t)seruart->TxCRC; /* CRC低字节先发。 */
+    seruart->T_DATA[seruart->SendLen + 1U] = (uint8_t)(seruart->TxCRC >> 8U); /* CRC高字节后发。 */
+    Modbus_Send(USARTx, seruart->T_DATA, seruart->SendLen + 2U); /* 恢复中断后发送，不阻塞保护调度。 */
+}
+
+/*
+ * 函数功能：组装无刷运行反馈，按请求版本发送实际保护时间。
+ * 输入参数：USARTx为串口；seruart为本次已校验的请求和回复缓存。
+ * 返回参数：无。
+ */
 void Customize_Return(USART_Type* USARTx,MCUART_Type* seruart){
 	uint32_t temp = 0;
 //	uint32_t temp1 = 0;
@@ -1112,16 +1154,15 @@ void Customize_Return(USART_Type* USARTx,MCUART_Type* seruart){
 	seruart->T_DATA[8] =	(uint16_t) ((temp3&0x0000FF00)>>8);
   seruart->T_DATA[9] =	(uint16_t) ((temp3)&0x000000FF);	
 
-	seruart->SendLen = 10;
-	seruart->TxCRC = CRC_Calc(seruart->T_DATA,10);
-	seruart->T_DATA[10] = seruart->TxCRC & 0x00FF;  //CRC 先低位在开位
-	seruart->T_DATA[11] = seruart->TxCRC >> 8;     
-
-	Modbus_Send(USARTx,seruart->T_DATA,12);
+	MotorCommand_SendFeedback(USARTx, seruart); /* 新旧版本共用状态字段，实际时间与CRC由统一出口追加。 */
 }
 
 
-//有刷特殊指令返回
+/*
+ * 函数功能：组装有刷运行反馈并确认新协议能力，参数22/24不改变有刷保护规则。
+ * 输入参数：USARTx为串口；seruart为本次请求和回复缓存。
+ * 返回参数：无。
+ */
 void YSCustomize_Return(USART_Type* USARTx,MCUART_Type* seruart){
 	uint32_t temp = 0;
 	uint32_t temp1 = 0;
@@ -1148,12 +1189,7 @@ void YSCustomize_Return(USART_Type* USARTx,MCUART_Type* seruart){
 		seruart->T_DATA[9] =	(uint16_t) ((temp2)&0x000000FF);		
 	}
 
-	seruart->SendLen = 10;
-	seruart->TxCRC = CRC_Calc(seruart->T_DATA,10);
-	seruart->T_DATA[10] = seruart->TxCRC & 0x00FF;  //CRC 先低位在开位
-	seruart->T_DATA[11] = seruart->TxCRC >> 8;     
-
-	Modbus_Send(USARTx,seruart->T_DATA,12);
+	MotorCommand_SendFeedback(USARTx, seruart); /* 新旧版本共用状态字段，实际时间与CRC由统一出口追加。 */
 }
 
 //modbus 指令错误返回

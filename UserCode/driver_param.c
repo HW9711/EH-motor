@@ -339,7 +339,9 @@ uint8_t DriverParam_TryHandle(USART_Type *USARTx, MCUART_Type *seruart)
     index = seruart->R_DATA[3]; /* 普通06寄存器低字节表示参数索引。 */
     value = ((uint16_t)seruart->R_DATA[4] << 8U) | seruart->R_DATA[5]; /* 参数值按大端拼成无符号16位。 */
     if ((DriverParam_GetBank(bank, &bank_info) == 0U) || (index == 0U) ||
-        (index >= bank_info.valid_count) || (value > DRIVER_PARAM_VALUE_MAX))
+        (index >= bank_info.valid_count) || (value > DRIVER_PARAM_VALUE_MAX) ||
+        ((bank_info.brushed == 0U) && ((index == 22U) || (index == 24U)) &&
+         (value != Protect_ValidateTime(value)))) /* 维护写入拒绝非法无刷时间，有刷相同索引保持原含义。 */
     {
         DriverParam_SendError(USARTx, seruart, 0x86U, 0x02U); /* 地址索引0只读，且拒绝越界和高位回绕值。 */
         return 1U;

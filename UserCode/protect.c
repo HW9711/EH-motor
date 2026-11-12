@@ -3,7 +3,52 @@
 #include "youshua.h"
 #include "adc.h"
 #include "mcuart.h"
+/*
+ * 函数功能：校验参数22/24的毫秒值，非法值统一回退500ms。
+ * 输入参数：value为尚未截断的原始时间。
+ * 返回参数：合法原值或500ms。
+ */
+uint16_t Protect_ValidateTime(uint32_t value)
+{
+    return ((value >= MOTOR_OVERCURRENT_TIME_MIN_MS) && (value <= MOTOR_OVERCURRENT_TIME_MAX_MS))
+        ? (uint16_t)value : MOTOR_OVERCURRENT_TIME_DEFAULT_MS; /* 不把超大值钳位到1500ms，避免延长保护。 */
+}
+
+/*
+ * 函数功能：在控制命令临界区内装载两项独立时间，运行中只允许缩短，重复帧不重置计数。
+ * 输入参数：motor_kind为1/2无刷或3/4有刷物理通道；time22/time24为毫秒；stopped为全部输出已静止。
+ * 返回参数：无；配置仅存在保护RAM缓存，不能写入参数Flash。
+ */
+void Protect_ApplyCommandTimes(uint8_t motor_kind, uint16_t time22, uint16_t time24, uint8_t stopped)
+{
+    time22 = Protect_ValidateTime(time22); /* 接收入口再次校验，非法往复时间不能进入运行态。 */
+    time24 = Protect_ValidateTime(time24); /* 无霍尔独立回退，另一项合法配置不受影响。 */
+    if ((motor_kind == 1U) || (motor_kind == 3U))
+    {
+        if ((stopped != 0U) || ((float)time22 < App.FB.Prot.OverCurrentCnt2))
+            App.FB.Prot.OverCurrentCnt2 = time22; /* 静止时可装载新手柄；运行中不得增加当前过流窗口。 */
+        if ((stopped != 0U) || ((float)time24 < App.FB.Prot.OverCurrentCnt3))
+            App.FB.Prot.OverCurrentCnt3 = time24; /* 只更新阈值，OverCurrentCnt继续累计。 */
+    }
+    else if ((motor_kind == 2U) || (motor_kind == 4U))
+    {
+        if ((stopped != 0U) || ((float)time22 < App.FB2.Prot.OverCurrentCnt2))
+            App.FB2.Prot.OverCurrentCnt2 = time22; /* B物理通道不修改A通道保护时间。 */
+        if ((stopped != 0U) || ((float)time24 < App.FB2.Prot.OverCurrentCnt3))
+            App.FB2.Prot.OverCurrentCnt3 = time24; /* 保留B通道已经累计的过流计数。 */
+    }
+}
+
+/*
+ * 函数功能：按Flash/RAM参数初始化保护缓存，并清理参数22/24的非法历史值。
+ * 输入参数：无；仅在上电或完全停止的维护流程调用。
+ * 返回参数：无。
+ */
 void Protect_Init(void){
+    MCPara[22] = Protect_ValidateTime(MCPara[22]); /* A往复时间越界在RAM中回退，不自动擦写Flash。 */
+    MCPara[24] = Protect_ValidateTime(MCPara[24]); /* A无霍尔时间独立检查。 */
+    MCPara2[22] = Protect_ValidateTime(MCPara2[22]); /* B往复时间不继承A配置。 */
+    MCPara2[24] = Protect_ValidateTime(MCPara2[24]); /* B无霍尔时间独立回退。 */
 	App.FB.Prot.CurrentLPFXiSHU = (float)MCPara[9]/100.0f;
 	
 	App.FB.Prot.UnderVoltage = (float)MCPara[2] / 10.0f;			//系统欠压保护值
